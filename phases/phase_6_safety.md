@@ -261,6 +261,101 @@ Examples of what it must **not** do:
 
 ---
 
+# Phase 6.X — SELL Safety Lock-Ins (Position-Based Exits)
+
+> This section extends Phase 6 with locked decisions for **SELL safety** and **partial closes**.  
+> It does **not modify previous Phase 6 text**.
+
+Phase 6 must support generating execution candidates for SELL orders.
+
+## SELL Must Be Position-Based
+
+SELL safety validation must operate on an existing **open position**.
+
+Rule:
+
+* SELL safety must not be “balance-based” by default.
+* If no open position exists for the symbol, SELL safety must fail closed.
+
+Reason:
+
+* consistent audit trail (entry → position → exit)
+* deterministic cost basis and realized PnL accounting
+* avoids accidental selling of unrelated holdings
+
+## Close Modes (Partial Close Support)
+
+SELL safety must support the following `close_mode` values:
+
+* `amount` (base-asset quantity, e.g., sell 1 SOL)
+* `percent` (of remaining position quantity, e.g., sell 50%)
+* `all` (close as much as safely tradable)
+
+### Deterministic Quantity Selection
+
+For SELL candidates, the system must determine a requested base quantity and then apply exchange rule normalization:
+
+* `sell_qty_rounded = round_down_to_step_size(requested_qty, stepSize)`
+
+Hard stops:
+
+* if `sell_qty_rounded` becomes `0`
+* if `sell_qty_rounded < minQty`
+* if `sell_qty_rounded × price < minNotional`
+* if `sell_qty_rounded > free_base_balance`
+
+If rounding reduces requested quantity, the safety result may still be `safe_with_warning`, but must record a warning like:
+
+```text
+sell_qty_rounded_down
+```
+
+## LIMIT_SELL Requires Limit Price
+
+If the candidate order type is `LIMIT_SELL`:
+
+* `limit_price` must be provided (candidate snapshot value)
+* the limit price must be rounded down to tick size
+
+Phase 6 must be partial-fill aware by design:
+
+* safety approves the candidate shape
+* execution/reconciliation later determines actual fills
+
+## Fee Asset Awareness (commissionAsset)
+
+Safety must assume fees are charged by Binance in a variable asset.
+
+Rule:
+
+* do not assume the commission asset is base or quote
+* do not assume a fixed fee mode across networks/accounts
+* always treat `fills[].commissionAsset` as the ground truth for fee accounting
+
+If fee asset is neither base nor quote:
+
+* record a warning indicating PnL may be degraded unless a deterministic conversion rule exists
+
+## Dust Must Not Block Safety
+
+Rounding rules can leave small “dust” balances.
+
+Safety must not allow dust to block new entry decisions indefinitely.
+
+Rule:
+
+* if an open position exists but its remaining quantity is below `minQty`, it may be treated as dust and closed locally (with a warning) rather than hard-blocking a new BUY.
+
+This is a local model cleanup to preserve determinism and avoid permanent deadlocks caused by rounding dust.
+
+## Reference Document
+
+This phase must follow:
+
+* `phases/locked_rules_sell_pnl_dust.md`
+
+---
+
 # Risk Management Layer
 
 The Risk Management Layer ensures that a technically valid trade is also **safely acceptable**.

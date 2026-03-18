@@ -5,7 +5,7 @@ from pathlib import Path
 from cryptogent.config.io import DEFAULT_DB_PATH, load_config
 from cryptogent.db.connection import connect
 
-TARGET_SCHEMA_VERSION = 12
+TARGET_SCHEMA_VERSION = 25
 
 
 def _read_schema_sql() -> str:
@@ -154,10 +154,246 @@ def _migrate_to_v6(conn) -> None:
     conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_trade_requests_request_id ON trade_requests(request_id)")
 
     _add_column_if_missing(conn, "trade_requests", "exit_asset", "exit_asset TEXT")
+
+
+def _migrate_to_v18(conn) -> None:
+    # Track source of each cached order row (execution/manual/external).
+    _add_column_if_missing(conn, "orders", "order_source", "order_source TEXT NOT NULL DEFAULT 'external'")
+
+
+def _migrate_to_v19(conn) -> None:
+    # Dust ledger for leftover untradable quantities (accounting only).
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS dust_ledger (
+          dust_id INTEGER PRIMARY KEY AUTOINCREMENT,
+          asset TEXT NOT NULL UNIQUE,
+          dust_qty TEXT NOT NULL,
+          avg_cost_price TEXT NOT NULL,
+          needs_reconcile INTEGER NOT NULL DEFAULT 1,
+          created_at_utc TEXT NOT NULL,
+          updated_at_utc TEXT NOT NULL
+        )
+        """
+    )
+    # Store base/quote asset on positions so dust ledger can avoid double-counting against open positions.
+    _add_column_if_missing(conn, "positions", "base_asset", "base_asset TEXT")
+    _add_column_if_missing(conn, "positions", "quote_asset", "quote_asset TEXT")
     _add_column_if_missing(conn, "trade_requests", "label", "label TEXT")
     _add_column_if_missing(conn, "trade_requests", "notes", "notes TEXT")
     _add_column_if_missing(conn, "trade_requests", "budget_mode", "budget_mode TEXT")
     _add_column_if_missing(conn, "trade_requests", "deadline_hours", "deadline_hours INTEGER")
+
+
+def _migrate_to_v20(conn) -> None:
+    # Phase 12 Manual Loop Trading Mode (human-only)
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS loop_sessions (
+          loop_id INTEGER PRIMARY KEY AUTOINCREMENT,
+          created_at_utc TEXT NOT NULL,
+          updated_at_utc TEXT NOT NULL,
+          dry_run INTEGER NOT NULL DEFAULT 0,
+          status TEXT NOT NULL,
+          execution_environment TEXT NOT NULL,
+          base_url TEXT NOT NULL,
+          symbol TEXT NOT NULL,
+          quote_qty TEXT NOT NULL,
+          entry_order_type TEXT NOT NULL,
+          entry_limit_price TEXT,
+          take_profit_kind TEXT NOT NULL,
+          take_profit_value TEXT NOT NULL,
+          rebuy_kind TEXT,
+          rebuy_value TEXT,
+          stop_loss_kind TEXT,
+          stop_loss_value TEXT,
+          max_cycles INTEGER NOT NULL,
+          cycles_completed INTEGER NOT NULL DEFAULT 0,
+          state TEXT NOT NULL,
+          last_buy_leg_id INTEGER,
+          last_sell_leg_id INTEGER,
+          last_buy_avg_price TEXT,
+          last_sell_avg_price TEXT,
+          last_buy_executed_qty TEXT,
+          last_sell_executed_qty TEXT,
+          cumulative_realized_pnl_quote TEXT,
+          pnl_quote_asset TEXT,
+          stopped_at_utc TEXT,
+          last_error TEXT,
+          last_warning TEXT
+        )
+        """
+    )
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_loop_sessions_status ON loop_sessions(status)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_loop_sessions_symbol ON loop_sessions(symbol)")
+
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS loop_legs (
+          leg_id INTEGER PRIMARY KEY AUTOINCREMENT,
+          loop_id INTEGER NOT NULL,
+          created_at_utc TEXT NOT NULL,
+          updated_at_utc TEXT NOT NULL,
+          cycle_index INTEGER NOT NULL,
+          leg_role TEXT NOT NULL,
+          side TEXT NOT NULL,
+          order_type TEXT NOT NULL,
+          time_in_force TEXT,
+          limit_price TEXT,
+          quote_order_qty TEXT,
+          quantity TEXT,
+          client_order_id TEXT NOT NULL,
+          binance_order_id TEXT,
+          local_status TEXT NOT NULL,
+          raw_status TEXT,
+          retry_count INTEGER NOT NULL DEFAULT 0,
+          executed_quantity TEXT,
+          avg_fill_price TEXT,
+          total_quote_value TEXT,
+          fee_breakdown_json TEXT,
+          message TEXT,
+          submitted_at_utc TEXT,
+          reconciled_at_utc TEXT,
+          filled_at_utc TEXT,
+          FOREIGN KEY(loop_id) REFERENCES loop_sessions(loop_id)
+        )
+        """
+    )
+    conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_loop_legs_client_order_id ON loop_legs(client_order_id)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_loop_legs_loop_id ON loop_legs(loop_id)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_loop_legs_status ON loop_legs(local_status)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_loop_legs_binance_order_id ON loop_legs(binance_order_id)")
+
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS loop_events (
+          loop_event_id INTEGER PRIMARY KEY AUTOINCREMENT,
+          loop_id INTEGER NOT NULL,
+          created_at_utc TEXT NOT NULL,
+          event_type TEXT NOT NULL,
+          details_json TEXT,
+          FOREIGN KEY(loop_id) REFERENCES loop_sessions(loop_id)
+        )
+        """
+    )
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_loop_events_loop_id ON loop_events(loop_id)")
+
+
+def _migrate_to_v21(conn) -> None:
+    # Phase 12 Manual Loop Trading presets (saved configurations).
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS loop_presets (
+          preset_id INTEGER PRIMARY KEY AUTOINCREMENT,
+          created_at_utc TEXT NOT NULL,
+          updated_at_utc TEXT NOT NULL,
+          name TEXT,
+          notes TEXT,
+          symbol TEXT NOT NULL,
+          quote_qty TEXT NOT NULL,
+          entry_order_type TEXT NOT NULL,
+          entry_limit_price TEXT,
+          take_profit_kind TEXT NOT NULL,
+          take_profit_value TEXT NOT NULL,
+          rebuy_kind TEXT,
+          rebuy_value TEXT,
+          stop_loss_kind TEXT,
+          stop_loss_value TEXT,
+          max_cycles INTEGER NOT NULL
+        )
+        """
+    )
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_loop_presets_symbol ON loop_presets(symbol)")
+
+
+def _migrate_to_v22(conn) -> None:
+    """
+    Loop presets should not store max_cycles (chosen at start-time).
+    SQLite cannot DROP COLUMN directly, so rebuild loop_presets without max_cycles.
+    """
+    try:
+        cur = conn.execute("PRAGMA table_info(loop_presets)")
+        cols = [r["name"] for r in cur.fetchall()]
+    except Exception:
+        cols = []
+    if "loop_presets" not in [r["name"] for r in conn.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()]:
+        return
+    if "max_cycles" not in cols:
+        return
+
+    conn.execute(
+        """
+        CREATE TABLE loop_presets_new (
+          preset_id INTEGER PRIMARY KEY AUTOINCREMENT,
+          created_at_utc TEXT NOT NULL,
+          updated_at_utc TEXT NOT NULL,
+          name TEXT,
+          notes TEXT,
+          symbol TEXT NOT NULL,
+          quote_qty TEXT NOT NULL,
+          entry_order_type TEXT NOT NULL,
+          entry_limit_price TEXT,
+          take_profit_kind TEXT NOT NULL,
+          take_profit_value TEXT NOT NULL,
+          rebuy_kind TEXT,
+          rebuy_value TEXT,
+          stop_loss_kind TEXT,
+          stop_loss_value TEXT
+        )
+        """
+    )
+    conn.execute(
+        """
+        INSERT INTO loop_presets_new(
+          preset_id, created_at_utc, updated_at_utc, name, notes, symbol, quote_qty,
+          entry_order_type, entry_limit_price,
+          take_profit_kind, take_profit_value,
+          rebuy_kind, rebuy_value,
+          stop_loss_kind, stop_loss_value
+        )
+        SELECT
+          preset_id, created_at_utc, updated_at_utc, name, notes, symbol, quote_qty,
+          entry_order_type, entry_limit_price,
+          take_profit_kind, take_profit_value,
+          rebuy_kind, rebuy_value,
+          stop_loss_kind, stop_loss_value
+        FROM loop_presets
+        """
+    )
+    conn.execute("DROP TABLE loop_presets")
+    conn.execute("ALTER TABLE loop_presets_new RENAME TO loop_presets")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_loop_presets_symbol ON loop_presets(symbol)")
+
+
+def _migrate_to_v23(conn) -> None:
+    # Link loop_sessions to a stored preset (or an auto-created preset).
+    _add_column_if_missing(conn, "loop_sessions", "preset_id", "preset_id INTEGER")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_loop_sessions_preset_id ON loop_sessions(preset_id)")
+
+    # Structured audit fields for loop_events (details_json remains).
+    _add_column_if_missing(conn, "loop_events", "preset_id", "preset_id INTEGER")
+    _add_column_if_missing(conn, "loop_events", "symbol", "symbol TEXT")
+    _add_column_if_missing(conn, "loop_events", "side", "side TEXT")
+    _add_column_if_missing(conn, "loop_events", "cycle_number", "cycle_number INTEGER")
+    _add_column_if_missing(conn, "loop_events", "client_order_id", "client_order_id TEXT")
+    _add_column_if_missing(conn, "loop_events", "binance_order_id", "binance_order_id TEXT")
+    _add_column_if_missing(conn, "loop_events", "price", "price TEXT")
+    _add_column_if_missing(conn, "loop_events", "quantity", "quantity TEXT")
+    _add_column_if_missing(conn, "loop_events", "message", "message TEXT")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_loop_events_event_type ON loop_events(event_type)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_loop_events_preset_id ON loop_events(preset_id)")
+
+
+def _migrate_to_v24(conn) -> None:
+    # Manual loop stop-loss action (default stop_only; optional stop_and_exit).
+    _add_column_if_missing(conn, "loop_presets", "stop_loss_action", "stop_loss_action TEXT NOT NULL DEFAULT 'stop_only'")
+    _add_column_if_missing(conn, "loop_sessions", "stop_loss_action", "stop_loss_action TEXT NOT NULL DEFAULT 'stop_only'")
+
+
+def _migrate_to_v25(conn) -> None:
+    # Manual loop order cleanup policy (default cancel-open).
+    _add_column_if_missing(conn, "loop_presets", "cleanup_policy", "cleanup_policy TEXT NOT NULL DEFAULT 'cancel-open'")
+    _add_column_if_missing(conn, "loop_sessions", "cleanup_policy", "cleanup_policy TEXT NOT NULL DEFAULT 'cancel-open'")
 
 
 def _migrate_to_v7(conn) -> None:
@@ -380,6 +616,133 @@ def _migrate_to_v12(conn) -> None:
         pass
 
 
+def _migrate_to_v13(conn) -> None:
+    # Phase 7/8: record execution/fee metadata on positions for auditability.
+    _add_column_if_missing(conn, "positions", "source_execution_id", "source_execution_id INTEGER")
+    _add_column_if_missing(conn, "positions", "gross_quantity", "gross_quantity TEXT")
+    _add_column_if_missing(conn, "positions", "fee_amount", "fee_amount TEXT")
+    _add_column_if_missing(conn, "positions", "fee_asset", "fee_asset TEXT")
+
+
+def _migrate_to_v14(conn) -> None:
+    # Phase 7: store realized PnL (sell only) and full fee breakdown for auditability.
+    _add_column_if_missing(conn, "executions", "fee_breakdown_json", "fee_breakdown_json TEXT")
+    _add_column_if_missing(conn, "executions", "realized_pnl_quote", "realized_pnl_quote TEXT")
+    _add_column_if_missing(conn, "executions", "realized_pnl_quote_asset", "realized_pnl_quote_asset TEXT")
+    _add_column_if_missing(conn, "executions", "pnl_warnings_json", "pnl_warnings_json TEXT")
+
+
+def _migrate_to_v15(conn) -> None:
+    # Phase 8 prep: persist environments on positions so monitoring uses the correct price environment.
+    _add_column_if_missing(
+        conn,
+        "positions",
+        "market_data_environment",
+        "market_data_environment TEXT NOT NULL DEFAULT 'mainnet_public'",
+    )
+    _add_column_if_missing(
+        conn,
+        "positions",
+        "execution_environment",
+        "execution_environment TEXT NOT NULL DEFAULT 'mainnet'",
+    )
+    _add_column_if_missing(conn, "positions", "last_monitored_at_utc", "last_monitored_at_utc TEXT")
+
+    # Best-effort backfill:
+    # - execution_environment from executions via source_execution_id
+    # - market_data_environment from linked plan via executions.plan_id
+    try:
+        conn.execute(
+            """
+            UPDATE positions
+            SET execution_environment = (
+              SELECT execution_environment FROM executions WHERE executions.execution_id = positions.source_execution_id
+            )
+            WHERE (execution_environment IS NULL OR execution_environment = '')
+              AND source_execution_id IS NOT NULL
+            """
+        )
+    except Exception:
+        pass
+    try:
+        conn.execute(
+            """
+            UPDATE positions
+            SET market_data_environment = (
+              SELECT market_data_environment
+              FROM trade_plans
+              WHERE trade_plans.id = (
+                SELECT plan_id FROM executions WHERE executions.execution_id = positions.source_execution_id
+              )
+            )
+            WHERE (market_data_environment IS NULL OR market_data_environment = '')
+              AND source_execution_id IS NOT NULL
+            """
+        )
+    except Exception:
+        pass
+
+
+def _migrate_to_v16(conn) -> None:
+    # Phase 8: monitoring events (decisions only; no order placement).
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS monitoring_events (
+          monitoring_event_id INTEGER PRIMARY KEY AUTOINCREMENT,
+          position_id INTEGER NOT NULL,
+          created_at_utc TEXT NOT NULL,
+          symbol TEXT NOT NULL,
+          entry_price TEXT,
+          current_price TEXT,
+          pnl_percent TEXT,
+          decision TEXT NOT NULL,
+          exit_reason TEXT,
+          deadline_utc TEXT,
+          position_status TEXT,
+          error_code TEXT,
+          error_message TEXT,
+          FOREIGN KEY(position_id) REFERENCES positions(id)
+        )
+        """
+    )
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_monitoring_events_position_id ON monitoring_events(position_id)")
+
+
+def _migrate_to_v17(conn) -> None:
+    # Manual direct order mode (human-only): local persistence for previews, idempotency, and audit.
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS manual_orders (
+          manual_order_id INTEGER PRIMARY KEY AUTOINCREMENT,
+          created_at_utc TEXT NOT NULL,
+          updated_at_utc TEXT NOT NULL,
+          dry_run INTEGER NOT NULL,
+          execution_environment TEXT NOT NULL,
+          base_url TEXT NOT NULL,
+          symbol TEXT NOT NULL,
+          side TEXT NOT NULL,
+          order_type TEXT NOT NULL,
+          time_in_force TEXT,
+          limit_price TEXT,
+          quote_order_qty TEXT,
+          quantity TEXT,
+          client_order_id TEXT NOT NULL,
+          binance_order_id TEXT,
+          local_status TEXT NOT NULL,
+          raw_status TEXT,
+          retry_count INTEGER NOT NULL,
+          executed_quantity TEXT,
+          avg_fill_price TEXT,
+          total_quote_value TEXT,
+          fee_breakdown_json TEXT,
+          message TEXT,
+          details_json TEXT
+        )
+        """
+    )
+    conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_manual_orders_client_order_id ON manual_orders(client_order_id)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_manual_orders_created_at ON manual_orders(created_at_utc)")
+
 def ensure_db_initialized(*, config_path: Path, db_path: Path | None) -> Path:
     cfg = load_config(config_path)
     resolved_db_path = (db_path or cfg.db_path or DEFAULT_DB_PATH).expanduser()
@@ -388,8 +751,13 @@ def ensure_db_initialized(*, config_path: Path, db_path: Path | None) -> Path:
     schema_sql = _read_schema_sql()
 
     with connect(resolved_db_path) as conn:
-        conn.executescript(schema_sql)
+        # Important: Only apply the full schema.sql on *new* databases.
+        # On existing DBs, schema.sql may include indexes on columns introduced by later migrations,
+        # which would fail with "no such column" before we get a chance to migrate.
         current = _get_schema_version(conn)
+        if current <= 0:
+            conn.executescript(schema_sql)
+            current = _get_schema_version(conn)
         if current < 4:
             _migrate_to_v4(conn)
         if current < 5:
@@ -408,6 +776,32 @@ def ensure_db_initialized(*, config_path: Path, db_path: Path | None) -> Path:
             _migrate_to_v11(conn)
         if current < 12:
             _migrate_to_v12(conn)
+        if current < 13:
+            _migrate_to_v13(conn)
+        if current < 14:
+            _migrate_to_v14(conn)
+        if current < 15:
+            _migrate_to_v15(conn)
+        if current < 16:
+            _migrate_to_v16(conn)
+        if current < 17:
+            _migrate_to_v17(conn)
+        if current < 18:
+            _migrate_to_v18(conn)
+        if current < 19:
+            _migrate_to_v19(conn)
+        if current < 20:
+            _migrate_to_v20(conn)
+        if current < 21:
+            _migrate_to_v21(conn)
+        if current < 22:
+            _migrate_to_v22(conn)
+        if current < 23:
+            _migrate_to_v23(conn)
+        if current < 24:
+            _migrate_to_v24(conn)
+        if current < 25:
+            _migrate_to_v25(conn)
         conn.execute(
             "INSERT OR REPLACE INTO app_meta(key, value) VALUES(?, ?)",
             ("schema_version", str(TARGET_SCHEMA_VERSION)),

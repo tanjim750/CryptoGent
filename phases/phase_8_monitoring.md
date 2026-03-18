@@ -101,14 +101,20 @@ Suggested MVP behavior:
 
 # Monitoring Interval
 
-The interval should come from configuration.
+The interval should come from configuration **by default**, with CLI override.
+
+Priority order:
+
+1. CLI `--interval-seconds`
+2. `trading.monitoring_interval_seconds` from TOML
+3. Safe fallback default
 
 Example:
 
-```yaml
-trading:
-  monitoring_interval: 60
-````
+```toml
+[trading]
+monitoring_interval_seconds = 60
+```
 
 Meaning:
 
@@ -116,9 +122,11 @@ Meaning:
 every 60 seconds
 ```
 
-This interval should be easy to change.
+The monitoring loop should print the chosen interval and its source on startup:
 
-For MVP, the loop can be implemented as a simple scheduler or repeating task inside the local runtime.
+```text
+interval=60 source=config
+```
 
 ---
 
@@ -338,13 +346,13 @@ summary: Trade has less than 2 hours remaining before deadline.
 At each monitoring cycle, the system should decide one of the following:
 
 ```text
-continue_monitoring
-trigger_exit
-trigger_reevaluation
-pause_due_to_state_issue
+hold
+exit_recommended
+reevaluate
+data_unavailable
 ```
 
-This decision should be persisted and logged.
+This decision must be persisted and logged.
 
 ---
 
@@ -359,23 +367,28 @@ Suggested table:
 Fields:
 
 ```text
-id
+monitoring_event_id
 position_id
-event_type
-status
-reason
+created_at_utc
+symbol
+entry_price
 current_price
 pnl_percent
-created_at
+decision
+exit_reason
+deadline_utc
+position_status
+error_code
+error_message
 ```
 
-Possible `event_type` values:
+Possible `decision` values:
 
 ```text
-monitor_tick
-exit_trigger
-reevaluation_trigger
-warning
+hold
+exit_recommended
+reevaluate
+data_unavailable
 ```
 
 This helps with:
@@ -440,9 +453,10 @@ The monitoring phase should support CLI visibility for current trade status.
 Example commands:
 
 ```text
-show active position
-show monitoring status
-show current pnl
+cryptogent monitor once
+cryptogent monitor loop
+cryptogent position show <position_id>
+cryptogent monitor events list
 ```
 
 Example output:
@@ -591,5 +605,612 @@ Phase 8 is successful when the system can:
 * persist and log monitoring state
 * provide a clear monitoring decision for the next phase
 
+# Phase 8.X — Monitoring Refinements and Lock-Ins
+
+> This section extends **Phase 8 Monitoring** with deterministic rules required before implementation.  
+> It does **not modify previous Phase 8 text**.  
+> Monitoring must remain auditable, restart-safe, and clearly separated from execution.
+
+---
+
+# 8.X Monitoring Configuration Format
+
+The configuration example must use valid **TOML**, not YAML-like syntax.
+
+## Locked Example
+
+```toml
+[trading]
+monitoring_interval_seconds = 60
+monitoring_price_environment = "mainnet_public"
+```
+
+Allowed values for `monitoring_price_environment`:
+
+* `"mainnet_public"`
+* `"testnet"`
+
+---
+
+# 8.X Remaining Implementation Checklist
+
+This section lists the remaining items required to complete Phase 8.
+
+## 1) Config-driven monitoring interval
+
+**Status:** Implemented  
+**Notes:** Uses `--interval-seconds` when provided, otherwise `trading.monitoring_interval_seconds`, else fallback. Prints source on startup (`cli|config|fallback`).
+
+## 2) Monitoring failure backoff policy
+
+**Status:** Implemented  
+**Notes:** Backoff on repeated monitoring fetch failures:
+
+* first failure → next delay = interval × 2  
+* repeated failures → next delay = interval × 5  
+* success → reset to normal interval  
+
+Required monitoring events:
+
+```text
+monitoring_fetch_failed
+monitoring_backoff_applied
+monitoring_recovered
+```
+
+## 3) Re-evaluation trigger support
+
+**Status:** Implemented  
+**Notes:** Decision type `reevaluate` with reason codes (e.g. `soft_deadline_reached`, `profit_threshold_reached`, `drawdown_warning`) is persisted and shown in CLI outputs.
+
+## 4) Configuration format cleanup
+
+**Status:** Implemented  
+**Notes:** Replaced YAML-like examples with valid TOML. Example:
+
+```toml
+[trading]
+monitoring_interval_seconds = 15
+
+[monitoring]
+use_server_time = true
+```
+
+Optional future extension:
+
+```toml
+[monitoring]
+use_server_time = true
+backoff_multiplier_first = 2
+backoff_multiplier_repeated = 5
+```
+
+---
+
+# 8.X Monitoring Price Environment
+
+## Final Decision
+
+Phase 8 monitoring must use the **plan / position market-data environment**, not the runtime execution environment.
+
+## Rule
+
+Monitoring price checks must use:
+
+```text
+position.market_data_environment
+```
+
+or, if the position was created from a plan:
+
+```text
+trade_plan.market_data_environment
+```
+
+Monitoring must **not** implicitly switch to:
+
+```text
+binance.testnet = true | false
+```
+
+for price evaluation.
+
+## Reason
+
+Execution environment and price-observation environment are separate concerns.
+
+Example:
+
+* `execution_environment = testnet`
+* `market_data_environment = mainnet_public`
+
+In this case:
+
+* execution uses testnet
+* monitoring price uses mainnet public data
+
+This preserves consistency with earlier phase rules.
+
+---
+
+# 8.X Monitoring Scope
+
+## Final Decision
+
+Phase 8 monitors **positions only**.
+
+It does **not** monitor open LIMIT execution lifecycle as part of core position monitoring.
+
+## Rule
+
+Phase 8 starts only **after a position exists**.
+
+Meaning:
+
+* MARKET BUY that created a position → Phase 8 monitors it
+* LIMIT BUY still open and not filled → not a Phase 8 position-monitoring concern
+
+## Responsibility Split
+
+| Concern                        | Responsible Component                             |
+| ------------------------------ | ------------------------------------------------- |
+| open LIMIT execution lifecycle | `trade reconcile` / execution reconciliation flow |
+| active position monitoring     | Phase 8                                           |
+
+## Clarification
+
+If a LIMIT BUY remains open with no filled quantity, Phase 8 must not create a synthetic position just to monitor it.
+
+---
+
+# 8.X Position Quantity Definition
+
+PnL logic must define whether monitored quantity is **gross** or **net**.
+
+## Final Decision
+
+Phase 8 position quantity must use **net position quantity**.
+
+## Rule
+
+If BUY commission is charged in base asset:
+
+```text
+net_position_quantity = executed_quantity - base_asset_commission
+```
+
+If commission is charged in quote asset or another asset:
+
+* base quantity remains unchanged
+* fee must still be reflected in PnL accounting where applicable
+
+## Example
+
+If a BUY fill returns:
+
+* `executed_quantity = 0.01000000 BTC`
+* `commission = 0.00001000 BTC`
+* `commission_asset = BTC`
+
+Then:
+
+```text
+net_position_quantity = 0.00999000 BTC
+```
+
+This net quantity is the monitored position size.
+
+---
+
+# 8.X PnL Precision Rules
+
+## Final Decision
+
+PnL calculations must use **Decimal**, never float.
+
+## Rule
+
+All of the following must be handled using decimal-safe arithmetic:
+
+* entry price
+* current price
+* quantity
+* quote value
+* fee adjustments
+* percentage calculations
+
+## Reason
+
+Float arithmetic introduces drift and can break:
+
+* threshold checks
+* stop-loss logic
+* take-profit logic
+* audit reproducibility
+
+---
+
+# 8.X PnL Definition
+
+Phase 8 must define unrealized PnL deterministically.
+
+## Required Stored Inputs
+
+At minimum:
+
+* `entry_price`
+* `current_price`
+* `net_position_quantity`
+* fee-adjusted cost basis where available
+
+## Recommended Formula
+
+For long spot position:
+
+```text
+position_market_value = current_price × net_position_quantity
+position_cost_basis = entry_price × net_position_quantity
+unrealized_pnl = position_market_value - position_cost_basis
+pnl_percent = unrealized_pnl / position_cost_basis × 100
+```
+
+## Fee Treatment
+
+If fees were charged in base asset:
+
+* reflected through reduced `net_position_quantity`
+
+If fees were charged in quote asset:
+
+* may be added to cost basis if stored and available
+
+If fees were charged in another asset:
+
+* record them separately
+* do not silently convert unless a deterministic conversion rule exists
+
+---
+
+# 8.X Monitoring Outputs Are Decisions, Not Actions
+
+## Final Decision
+
+Phase 8 monitoring must produce **decision outputs only**.
+
+It must **not** place exit orders.
+
+## Allowed Outputs
+
+* hold
+* warning
+* exit_triggered
+* deadline_reached
+* stop_loss_triggered
+* take_profit_triggered
+* monitoring_paused
+
+## Rule
+
+If an exit condition is met, Phase 8 must:
+
+1. create and persist an exit trigger / monitoring event
+2. print the decision summary
+3. stop there
+
+Actual exit execution belongs to a later phase.
+
+## Architectural Principle
+
+| Phase    | Responsibility   |
+| -------- | ---------------- |
+| Phase 8  | observe + decide |
+| Phase 9+ | execute exit     |
+
+---
+
+# 8.X Monitoring Event Persistence
+
+The minimal event shape must be expanded so events are useful for:
+
+* audit
+* restart recovery
+* debugging
+* post-trade analysis
+
+## Required `monitoring_events` Fields
+
+* `monitoring_event_id`
+* `position_id`
+* `created_at_utc`
+* `symbol`
+* `entry_price`
+* `current_price`
+* `pnl_percent`
+* `decision`
+* `exit_reason`
+* `deadline_utc`
+* `position_status`
+* `error_code`
+* `error_message`
+
+## Notes
+
+* `exit_reason` may be null when no exit trigger exists
+* `error_code` / `error_message` are used for monitoring failures
+* numeric fields must be persisted in decimal-safe string or fixed-precision form
+
+---
+
+# 8.X Position State Persistence
+
+Phase 8 should assume monitoring may restart at any time.
+
+Therefore position state must be restart-safe.
+
+## Minimum Recommended Position Fields
+
+* `position_id`
+* `symbol`
+* `market_data_environment`
+* `execution_environment`
+* `entry_price`
+* `net_position_quantity`
+* `position_status`
+* `deadline_utc`
+* `created_at_utc`
+* `updated_at_utc`
+* `last_monitored_at_utc`
+
+---
+
+# 8.X Monitoring Worst-Case Scenarios
+
+The following additional worst cases must be explicitly handled.
+
+## 1. Price Endpoint Unavailable or Rate-Limited
+
+### Behavior
+
+* apply backoff
+* persist monitoring event
+* set decision/state:
+
+```text
+pause_due_to_state_issue
+```
+
+### Required Event Data
+
+* `error_code`
+* `error_message`
+* `created_at_utc`
+
+---
+
+## 2. Clock Skew / Bad Local Time
+
+### Risk
+
+Deadline triggers may fire incorrectly if local system time is wrong.
+
+## Rule
+
+Use server time when available for deadline-sensitive comparisons.
+
+If server time is unavailable:
+
+* use local UTC time
+* persist warning event
+* mark monitoring tick as degraded if skew is suspected
+
+---
+
+## 3. Position Missing Fields After Restart
+
+### Rule
+
+If required fields are missing after restart:
+
+* fail the monitoring tick closed
+* do not compute PnL
+* persist warning / error event
+* leave position unchanged until repaired
+
+Required missing-field examples:
+
+* missing entry price
+* missing quantity
+* missing market data environment
+* missing deadline when deadline-based monitoring is enabled
+
+---
+
+## 4. Symbol Halted / Not Trading
+
+### Rule
+
+If a monitored symbol becomes halted or non-trading:
+
+* persist immediate warning event
+* create re-evaluation / exit-trigger candidate
+* do not silently continue normal monitoring
+
+This is a serious state change and must be surfaced.
+
+---
+
+# 8.X Backoff Rule
+
+Monitoring failures must not hammer APIs.
+
+## Recommended Rule
+
+On repeated price-fetch failures:
+
+* first failure: record warning
+* repeated failures: exponential or stepped backoff
+* persist each state transition
+
+Example policy:
+
+```text
+attempt 1 → next check in normal interval
+attempt 2 → backoff to 2 × interval
+attempt 3+ → backoff to 5 × interval, capped
+```
+
+---
+
+# 8.X CLI Interface
+
+Because CLI commands are the real external API, Phase 8 must define concrete commands early.
+
+## Locked Commands
+
+```bash
+cryptogent monitor once
+cryptogent monitor loop
+cryptogent position show <position_id>
+cryptogent monitor events list
+```
+
+## Command Roles
+
+### `cryptogent monitor once`
+
+* run one monitoring tick
+* evaluate active positions
+* persist monitoring events
+* print summary
+
+### `cryptogent monitor loop`
+
+* repeatedly run monitoring ticks
+* sleep using `monitoring_interval_seconds`
+* intended for long-running local or server process
+
+### `cryptogent position show <position_id>`
+
+* display stored position details
+* show entry price, quantity, environment, status, latest monitoring result
+
+### `cryptogent monitor events list`
+
+* list monitoring history
+* show warnings, trigger decisions, errors, pauses
+
+---
+
+# 8.X Open Orders Visibility Note
+
+Add this note to Phase 8 documentation:
+
+> Active LIMIT orders may appear in open-order views, but Phase 8 does not treat open executions as positions. Monitoring begins only after a position exists.
+
+This avoids confusion between:
+
+* execution lifecycle
+* position lifecycle
+
+---
+
+# 8.X Rules Snapshot vs Live Rules
+
+## Final Decision
+
+Phase 8 position monitoring does **not** need full live rule re-validation on every tick.
+
+It should primarily use persisted position / plan context and current market price.
+
+Live rule rechecks may be used only when needed for:
+
+* symbol trading status
+* environment consistency
+* exceptional state changes
+
+Monitoring is not a re-planning phase.
+
+---
+
+# 8.X Final Locked Summary
+
+| Area                           | Locked Decision                             |
+| ------------------------------ | ------------------------------------------- |
+| Config format                  | valid TOML                                  |
+| Price environment              | use `market_data_environment`               |
+| Scope                          | monitor positions only                      |
+| Open LIMIT handling            | handled by reconcile, not core Phase 8      |
+| Position quantity              | net quantity                                |
+| Arithmetic                     | Decimal only                                |
+| Monitoring result              | decision output only                        |
+| Exit action                    | deferred to later phase                     |
+| Event persistence              | expanded audit fields required              |
+| Timeout / deadline time source | prefer server time                          |
+| CLI                            | `monitor once`, `monitor loop`, `position show`, `monitor events list` |
+
+---
+
+# 8.X Implementation Principle
+
+Phase 8 must remain a **state observer and decision engine** for active positions.
+
+It must:
+
+* read persisted position state
+* fetch current price using the correct market-data environment
+* compute fee-aware PnL with Decimal
+* produce auditable monitoring decisions
+* avoid placing any orders
+
 ```
 ```
+
+---
+
+# Phase 8.X — Dust Ledger Visibility (Accounting Only)
+
+> This section extends Phase 8 with dust-ledger monitoring guidance.  
+> It does **not modify previous Phase 8 text**.
+
+## Dust Is Not a Position
+
+Dust balances must not be treated as positions for monitoring decisions.
+
+Rule:
+
+* Phase 8 monitors positions only
+* dust ledger is accounting-only and should not trigger exit logic
+
+## Dust Ledger Purpose in Phase 8
+
+The dust ledger exists to preserve cost basis for accumulated dust so that if dust is later sold (manually), realized PnL can be computed deterministically.
+
+## Recommended Visibility Outputs
+
+Phase 8 (or adjacent CLI/status views) should be able to report:
+
+* dust quantity per asset
+* average cost price
+* whether the dust row needs reconciliation (`needs_reconcile`)
+
+If dust becomes tradable (>= `minQty` and `minNotional`):
+
+* emit a warning event
+* recommend a manual dust sweep flow (future phase)
+
+## Source of Truth Reminder
+
+Binance balances remain the source of truth.
+
+The dust ledger must be reconciled (clamped) on successful balance syncs using:
+
+```text
+max_unpositioned_free = max(0, binance_free_balance - open_position_qty_total)
+effective_dust = min(dust_ledger_qty, max_unpositioned_free)
+```
+
+## Reference Document
+
+This phase must follow:
+
+* `phases/locked_rules_sell_pnl_dust.md`

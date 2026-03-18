@@ -3,11 +3,18 @@ from __future__ import annotations
 import argparse
 import sys
 import os
+import time
+import select
+import shutil
+import termios
+import tty
+import contextlib
 from pathlib import Path
 from datetime import UTC, datetime
 
 from cryptogent.config.io import BINANCE_SPOT_BASE_URL, ConfigPaths, ensure_default_config
 from cryptogent.config.io import load_config
+from cryptogent.config.model import AppConfig
 from cryptogent.config.edit import BinanceCredentialUpdate, update_binance_config
 from cryptogent.db.migrate import ensure_db_initialized
 from cryptogent.db.connection import connect
@@ -16,14 +23,23 @@ from cryptogent.exchange.binance_spot import BinanceSpotClient
 from cryptogent.market.market_data_service import MarketDataError, fetch_market_snapshot
 from cryptogent.planning.trade_planner import PlanningError, build_trade_plan, persist_trade_plan
 from cryptogent.safety.validator import SafetyError, evaluate_safety
-from cryptogent.execution.executor import ExecutionError, execute_limit_buy, execute_market_buy_quote
-from cryptogent.state.manager import StateManager
+from cryptogent.execution.executor import (
+    ExecutionError,
+    execute_limit_buy,
+    execute_limit_sell,
+    execute_market_buy_quote,
+    execute_market_sell_qty,
+)
+from cryptogent.execution.result_parser import parse_fills
+from cryptogent.state.manager import OrderRow, StateManager
 from cryptogent.sync.binance_sync import startup_sync, sync_balances, sync_open_orders
 from cryptogent.validation.trade_request import ValidationError, validate_trade_request
-from cryptogent.validation.binance_rules import parse_symbol_rules, precheck_market_buy, RuleError
+from cryptogent.validation.binance_rules import parse_symbol_rules, precheck_market_buy, quantize_down, RuleError
 from cryptogent.planning.feasibility import FeasibilityError, evaluate_feasibility, freshness_and_consistency_checks
-from cryptogent.util.time import utcnow_iso
+from cryptogent.util.time import ms_to_utc_iso, utcnow_iso
 from decimal import Decimal, InvalidOperation
+import secrets
+import json as _json
 
 
 def _add_common_paths(parser: argparse.ArgumentParser) -> None:
@@ -65,6 +81,20 @@ def _add_exchange_tls_args(parser: argparse.ArgumentParser) -> None:
     )
 
 
+def _add_exchange_tls_only_args(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument(
+        "--ca-bundle",
+        type=Path,
+        default=None,
+        help="Path to a PEM CA bundle to trust (useful behind TLS-intercepting proxies).",
+    )
+    parser.add_argument(
+        "--insecure",
+        action="store_true",
+        help="Disable TLS cert verification (debug only; not recommended).",
+    )
+
+
 def cmd_init(args: argparse.Namespace) -> int:
     paths = ConfigPaths.from_cli(config_path=args.config, db_path=args.db)
     config_path = ensure_default_config(paths.config_path)
@@ -88,7 +118,9 @@ def cmd_config_show(args: argparse.Namespace) -> int:
     print(f"- binance_ca_bundle_path: {cfg.binance_ca_bundle_path}")
     print(f"- binance_api_key_set: {bool(cfg.binance_api_key)}")
     print(f"- binance_api_secret_set: {bool(cfg.binance_api_secret)}")
+    print(f"- binance_spot_bnb_burn: {cfg.binance_spot_bnb_burn}")
     print(f"- trading_auto_cancel_expired_limit_orders: {cfg.trading_auto_cancel_expired_limit_orders}")
+    print(f"- trading_monitoring_interval_seconds: {cfg.trading_monitoring_interval_seconds}")
     return 0
 
 
@@ -115,6 +147,14 @@ def cmd_config_set_binance(args: argparse.Namespace) -> int:
             api_secret=api_secret if api_secret not in (None, "") else None,
         ),
     )
+    # Best-effort: fetch + persist spotBNBBurn after credentials are set.
+    try:
+        cfg = load_config(config_path)
+        client = BinanceSpotClient.from_config(cfg)
+        burn = client.get_spot_bnb_burn()
+        update_binance_config(config_path, BinanceCredentialUpdate(spot_bnb_burn=burn))
+    except Exception:
+        pass
     print(f"Updated: {config_path}")
     return 0
 
@@ -213,7 +253,59 @@ def cmd_config_set_binance_testnet(args: argparse.Namespace) -> int:
             testnet_api_secret=api_secret if api_secret not in (None, "") else None,
         ),
     )
+    # Best-effort: fetch + persist spotBNBBurn after credentials are set (may not be supported on testnet).
+    try:
+        cfg = load_config(config_path)
+        client = BinanceSpotClient.from_config(cfg)
+        burn = client.get_spot_bnb_burn()
+        update_binance_config(config_path, BinanceCredentialUpdate(testnet_spot_bnb_burn=burn))
+    except Exception:
+        pass
     print(f"Updated: {config_path} ([binance_testnet])")
+    return 0
+
+
+def cmd_config_sync_bnb_burn(args: argparse.Namespace) -> int:
+    paths = ConfigPaths.from_cli(config_path=args.config, db_path=args.db)
+    config_path = ensure_default_config(paths.config_path)
+    cfg = load_config(config_path)
+    client = BinanceSpotClient.from_config(cfg)
+    try:
+        burn = client.get_spot_bnb_burn()
+    except BinanceAPIError as e:
+        if e.status == 404:
+            print("Not supported on this Binance base URL (likely Spot Testnet).")
+            return 2
+        print(f"ERROR: {e}")
+        return 2
+
+    if cfg.binance_testnet:
+        update_binance_config(config_path, BinanceCredentialUpdate(testnet_spot_bnb_burn=burn))
+    else:
+        update_binance_config(config_path, BinanceCredentialUpdate(spot_bnb_burn=burn))
+    print(f"spotBNBBurn={burn} (saved to {config_path})")
+    return 0
+
+
+def cmd_config_set_bnb_burn(args: argparse.Namespace) -> int:
+    paths = ConfigPaths.from_cli(config_path=args.config, db_path=args.db)
+    config_path = ensure_default_config(paths.config_path)
+    cfg = load_config(config_path)
+    client = BinanceSpotClient.from_config(cfg)
+    try:
+        burn = client.set_spot_bnb_burn(enabled=bool(args.enabled))
+    except BinanceAPIError as e:
+        if e.status == 404:
+            print("Not supported on this Binance base URL (likely Spot Testnet).")
+            return 2
+        print(f"ERROR: {e}")
+        return 2
+
+    if cfg.binance_testnet:
+        update_binance_config(config_path, BinanceCredentialUpdate(testnet_spot_bnb_burn=burn))
+    else:
+        update_binance_config(config_path, BinanceCredentialUpdate(spot_bnb_burn=burn))
+    print(f"spotBNBBurn={burn} (saved to {config_path})")
     return 0
 
 
@@ -322,11 +414,30 @@ def cmd_show_balances(args: argparse.Namespace) -> int:
     db_path = ensure_db_initialized(config_path=config_path, db_path=paths.db_path)
     with connect(db_path) as conn:
         state = StateManager(conn)
-        rows = state.list_balances(include_zero=args.all, limit=args.limit)
-    if getattr(args, "filter", None):
-        flt = str(args.filter).strip().upper()
-        if flt:
-            rows = [r for r in rows if flt in str(r.get("asset", "")).upper()]
+        # If filtering, pull full set first so the limit applies after filtering.
+        want_filter = str(getattr(args, "filter", "") or "").strip()
+        rows = state.list_balances(include_zero=args.all, limit=None if want_filter else args.limit)
+
+    if want_filter:
+        contains = bool(getattr(args, "contains", False))
+        raw = want_filter.strip()
+        if raw.startswith("*") and raw.endswith("*") and len(raw) > 2:
+            contains = True
+            raw = raw.strip("*")
+        raw = raw.upper()
+        if contains:
+            rows = [r for r in rows if raw in str(r.get("asset", "")).upper()]
+        else:
+            # Exact asset match by default (supports comma/space lists like "SOL,AI").
+            tokens = [t.strip().upper() for t in raw.replace(" ", ",").split(",") if t.strip()]
+            wanted = set(tokens)
+            rows = [r for r in rows if str(r.get("asset", "")).upper() in wanted]
+
+    if getattr(args, "limit", None) is not None:
+        try:
+            rows = rows[: int(args.limit)]
+        except Exception:
+            pass
     if not rows:
         print("(no balances cached)")
         return 0
@@ -364,10 +475,11 @@ def cmd_show_open_orders(args: argparse.Namespace) -> int:
         print("(no open orders cached)")
         return 0
     for r in rows:
+        src = str(r.get("order_source") or "external")
         print(
             f"{r['symbol']} {r['side']} {r['type']} status={r['status']} "
             f"price={r['price']} qty={r['quantity']} filled={r['filled_quantity']} "
-            f"updated={r['updated_at_utc']} id={r['exchange_order_id']}"
+            f"updated={r['updated_at_utc']} id={r['exchange_order_id']} src={src}"
         )
     return 0
 
@@ -386,6 +498,221 @@ def cmd_show_audit(args: argparse.Namespace) -> int:
         details = r.get("details_json")
         details_s = f" details={details}" if details not in (None, "", "{}") else ""
         print(f"{r['created_at_utc']} {r['level']} {r['event']}{details_s}")
+    return 0
+
+
+def cmd_dust_list(args: argparse.Namespace) -> int:
+    paths = ConfigPaths.from_cli(config_path=args.config, db_path=args.db)
+    config_path = ensure_default_config(paths.config_path)
+    db_path = ensure_db_initialized(config_path=config_path, db_path=paths.db_path)
+    limit = int(getattr(args, "limit", 200))
+    with connect(db_path) as conn:
+        state = StateManager(conn)
+        rows = state.list_dust(limit=limit)
+        balances = {str(r.get("asset") or "").upper(): Decimal(str(r.get("free") or "0")) for r in state.list_balances(include_zero=True, limit=None)}
+        open_pos_qty = state.get_open_position_qty_by_asset()
+
+    if not rows:
+        print("(no dust ledger rows)")
+        return 0
+
+    def _d(v: object) -> Decimal:
+        try:
+            return Decimal(str(v))
+        except Exception:
+            return Decimal("0")
+
+    print(f"Dust ledger: {len(rows)}")
+    print(f"{'ASSET':<10} {'DUST_QTY':>16} {'AVG_COST':>16} {'EFFECTIVE':>16} {'NEEDS_REC':>10} {'UPDATED (UTC)':>22}")
+    for r in rows:
+        asset = str(r.get("asset") or "").strip().upper()
+        dust_qty = _d(r.get("dust_qty"))
+        avg_cost = _d(r.get("avg_cost_price"))
+        needs = int(r.get("needs_reconcile") or 0)
+        free = balances.get(asset, Decimal("0"))
+        reserved = open_pos_qty.get(asset, Decimal("0"))
+        allowed = free - reserved
+        if allowed < 0:
+            allowed = Decimal("0")
+        effective = dust_qty if dust_qty <= allowed else allowed
+        updated_at = str(r.get("updated_at_utc") or "")
+        print(
+            f"{asset:<10} {str(dust_qty):>16} {str(avg_cost):>16} {str(effective):>16} {needs:>10} {updated_at:>22}"
+        )
+    return 0
+
+
+def cmd_dust_show(args: argparse.Namespace) -> int:
+    paths = ConfigPaths.from_cli(config_path=args.config, db_path=args.db)
+    config_path = ensure_default_config(paths.config_path)
+    db_path = ensure_db_initialized(config_path=config_path, db_path=paths.db_path)
+    asset = str(getattr(args, "asset", "") or "").strip().upper()
+    if not asset:
+        print("ERROR: missing asset")
+        return 2
+    with connect(db_path) as conn:
+        state = StateManager(conn)
+        row = state.get_dust(asset=asset)
+        free = state.get_cached_balance_free(asset=asset) or Decimal("0")
+        reserved = state.get_open_position_qty_by_asset().get(asset, Decimal("0"))
+    if not row:
+        print("(not found)")
+        return 2
+    dust_qty = Decimal(str(row.get("dust_qty") or "0"))
+    avg_cost = Decimal(str(row.get("avg_cost_price") or "0"))
+    allowed = free - reserved
+    if allowed < 0:
+        allowed = Decimal("0")
+    effective = dust_qty if dust_qty <= allowed else allowed
+    print(f"asset={asset}")
+    print(f"dust_qty={row.get('dust_qty')}")
+    print(f"avg_cost_price={row.get('avg_cost_price')}")
+    print(f"needs_reconcile={row.get('needs_reconcile')}")
+    print(f"binance_free_cached={str(free)}")
+    print(f"open_position_qty={str(reserved)}")
+    print(f"effective_dust={str(effective)}")
+    return 0
+
+
+def cmd_pnl_realized_list(args: argparse.Namespace) -> int:
+    paths = ConfigPaths.from_cli(config_path=args.config, db_path=args.db)
+    config_path = ensure_default_config(paths.config_path)
+    db_path = ensure_db_initialized(config_path=config_path, db_path=paths.db_path)
+    limit = int(getattr(args, "limit", 50))
+    with connect(db_path) as conn:
+        cur = conn.execute(
+            """
+            SELECT execution_id, symbol, order_type,
+                   realized_pnl_quote, realized_pnl_quote_asset, pnl_warnings_json,
+                   submitted_at_utc, reconciled_at_utc, updated_at_utc
+            FROM executions
+            WHERE realized_pnl_quote IS NOT NULL
+              AND order_type IN ('MARKET_SELL','LIMIT_SELL')
+            ORDER BY execution_id DESC
+            LIMIT ?
+            """,
+            (int(limit),),
+        )
+        rows = [dict(r) for r in cur.fetchall()]
+    if not rows:
+        print("(no realized PnL rows)")
+        return 0
+    print(f"Realized PnL: {len(rows)}")
+    print(f"{'EXEC_ID':>7} {'SYMBOL':<10} {'TYPE':<11} {'PNL':>18} {'ASSET':<6} {'AT_UTC':<22} {'WARN':<5}")
+    for r in rows:
+        warn = "yes" if (r.get("pnl_warnings_json") not in (None, "", "[]")) else "no"
+        at = str(r.get("reconciled_at_utc") or r.get("submitted_at_utc") or r.get("updated_at_utc") or "")
+        print(
+            f"{int(r.get('execution_id') or 0):>7} "
+            f"{str(r.get('symbol') or '-'): <10} "
+            f"{str(r.get('order_type') or '-'): <11} "
+            f"{str(r.get('realized_pnl_quote') or '-'): >18} "
+            f"{str(r.get('realized_pnl_quote_asset') or '-'): <6} "
+            f"{at: <22} "
+            f"{warn:<5}"
+        )
+    return 0
+
+
+def cmd_pnl_realized_show(args: argparse.Namespace) -> int:
+    paths = ConfigPaths.from_cli(config_path=args.config, db_path=args.db)
+    config_path = ensure_default_config(paths.config_path)
+    db_path = ensure_db_initialized(config_path=config_path, db_path=paths.db_path)
+    exec_id = int(getattr(args, "execution_id"))
+    with connect(db_path) as conn:
+        cur = conn.execute("SELECT * FROM executions WHERE execution_id = ?", (exec_id,))
+        row = cur.fetchone()
+        if not row:
+            print("(not found)")
+            return 2
+        r = dict(row)
+    print(f"execution_id={r.get('execution_id')}")
+    print(f"symbol={r.get('symbol')}")
+    print(f"order_type={r.get('order_type')}")
+    print(f"raw_status={r.get('raw_status')}")
+    print(f"local_status={r.get('local_status')}")
+    print(f"executed_quantity={r.get('executed_quantity')}")
+    print(f"avg_fill_price={r.get('avg_fill_price')}")
+    print(f"total_quote_spent={r.get('total_quote_spent')}")
+    print(f"fee_breakdown_json={r.get('fee_breakdown_json')}")
+    print(f"realized_pnl_quote={r.get('realized_pnl_quote')}")
+    print(f"realized_pnl_quote_asset={r.get('realized_pnl_quote_asset')}")
+    print(f"pnl_warnings_json={r.get('pnl_warnings_json')}")
+    print(f"submitted_at_utc={r.get('submitted_at_utc')}")
+    print(f"reconciled_at_utc={r.get('reconciled_at_utc')}")
+    return 0
+
+
+def cmd_pnl_unrealized(args: argparse.Namespace) -> int:
+    paths = ConfigPaths.from_cli(config_path=args.config, db_path=args.db)
+    config_path = ensure_default_config(paths.config_path)
+    cfg = load_config(config_path)
+    db_path = ensure_db_initialized(config_path=config_path, db_path=paths.db_path)
+    limit = int(getattr(args, "limit", 50))
+    position_id = getattr(args, "position_id", None)
+    live = not bool(getattr(args, "no_live", False))
+
+    with connect(db_path) as conn:
+        state = StateManager(conn)
+        if position_id not in (None, ""):
+            pos = state.get_position(position_id=int(position_id))
+            rows = [pos] if pos else []
+        else:
+            rows = state.list_positions(status="OPEN", limit=limit)
+
+    if not rows:
+        print("(no open positions)")
+        return 0
+
+    def _d(v: object, name: str) -> Decimal:
+        try:
+            return Decimal(str(v))
+        except Exception as e:
+            raise ValueError(f"Invalid decimal for {name}") from e
+
+    print(f"Unrealized PnL (positions): {len(rows)}" + (" (live)" if live else " (no-live)"))
+    print(f"{'POS_ID':>6} {'SYMBOL':<10} {'MD_ENV':<13} {'QTY':>14} {'ENTRY':>14} {'PRICE':>14} {'PNL':>14} {'PNL%':>14}")
+
+    # Create per-env price clients lazily.
+    clients: dict[str, BinanceSpotClient] = {}
+    for r in rows:
+        if not r:
+            continue
+        if str(r.get("status") or "").upper() != "OPEN":
+            continue
+        sym = str(r.get("symbol") or "").strip().upper()
+        md_env = str(r.get("market_data_environment") or "mainnet_public")
+        qty = _d(r.get("quantity") or "0", "quantity")
+        entry = _d(r.get("entry_price") or "0", "entry_price")
+        price = Decimal("0")
+        if live:
+            if md_env not in clients:
+                clients[md_env] = _price_client_for_market_env(
+                    cfg=cfg,
+                    market_env=md_env,
+                    ca_bundle=getattr(args, "ca_bundle", None),
+                    insecure=bool(getattr(args, "insecure", False)),
+                )
+            try:
+                price = _d(clients[md_env].get_ticker_price(symbol=sym), "price")
+            except Exception:
+                price = Decimal("0")
+
+        market_value = price * qty if live else Decimal("0")
+        cost_basis = entry * qty
+        unrealized = (market_value - cost_basis) if live else Decimal("0")
+        pnl_pct = (unrealized / cost_basis * Decimal("100")) if (live and cost_basis > 0) else Decimal("0")
+
+        print(
+            f"{int(r.get('id') or 0):>6} "
+            f"{sym:<10} "
+            f"{str(md_env):<13} "
+            f"{str(qty):>14} "
+            f"{str(entry):>14} "
+            f"{(str(price) if live else '-'):>14} "
+            f"{(str(unrealized) if live else '-'):>14} "
+            f"{(str(pnl_pct) if live else '-'):>14}"
+        )
     return 0
 
 
@@ -601,9 +928,22 @@ def cmd_menu(args: argparse.Namespace) -> int:
                 sub = input("> ").strip()
                 if sub == "1":
                     limit_s = _prompt("How many rows?", default="25")
-                    flt = _prompt("Filter by asset substring (optional)", default="").strip() or None
+                    flt = _prompt('Filter assets (optional, exact e.g. "SOL,AI"; substring use "*SOL*")', default="").strip() or None
                     include_zero = _prompt_yes_no("Include zero balances?", default=False)
-                    cmd_show_balances(argparse.Namespace(config=args.config, db=args.db, all=include_zero, limit=int(limit_s), filter=flt))
+                    contains = False
+                    if flt and flt.startswith("*") and flt.endswith("*") and len(flt) > 2:
+                        contains = True
+                        flt = flt.strip("*")
+                    cmd_show_balances(
+                        argparse.Namespace(
+                            config=args.config,
+                            db=args.db,
+                            all=include_zero,
+                            limit=int(limit_s),
+                            filter=flt,
+                            contains=contains,
+                        )
+                    )
                 elif sub == "2":
                     sym = _prompt("Symbol (optional)", default="").upper().strip() or None
                     limit_s = _prompt("How many rows?", default="50")
@@ -784,10 +1124,22 @@ def cmd_menu(args: argparse.Namespace) -> int:
                     if not pid:
                         print(_style("No id provided", fg="red"))
                         continue
-                    order_type = _prompt("Order type (MARKET_BUY/LIMIT_BUY)", default="MARKET_BUY").strip().upper()
+                    order_type = _prompt(
+                        "Order type (MARKET_BUY/LIMIT_BUY/MARKET_SELL/LIMIT_SELL)",
+                        default="MARKET_BUY",
+                    ).strip().upper()
                     limit_price = None
-                    if order_type == "LIMIT_BUY":
+                    if order_type in ("LIMIT_BUY", "LIMIT_SELL"):
                         limit_price = _prompt("Limit price", default="").strip() or None
+                    close_mode = "all"
+                    close_amount = None
+                    close_percent = None
+                    if order_type.endswith("_SELL"):
+                        close_mode = _prompt("Close mode (amount/percent/all)", default="all").strip().lower() or "all"
+                        if close_mode == "amount":
+                            close_amount = _prompt("Close amount (base qty)", default="").strip() or None
+                        elif close_mode == "percent":
+                            close_percent = _prompt("Close percent (0-100)", default="").strip() or None
                     try:
                         cmd_trade_safety(
                             _net_ns(
@@ -799,6 +1151,9 @@ def cmd_menu(args: argparse.Namespace) -> int:
                                 max_stop_loss_pct="10",
                                 order_type=order_type,
                                 limit_price=limit_price,
+                                close_mode=close_mode,
+                                close_amount=close_amount,
+                                close_percent=close_percent,
                             )
                         )
                         try:
@@ -1427,6 +1782,10 @@ def cmd_trade_safety(args: argparse.Namespace) -> int:
                 limit_price = Decimal(str(limit_price_s))
             except Exception:
                 limit_price = None
+        close_mode = str(getattr(args, "close_mode", "all") or "all").strip().lower()
+        close_amount_s = getattr(args, "close_amount", None)
+        close_percent_s = getattr(args, "close_percent", None)
+        position_id = getattr(args, "position_id", None)
 
         try:
             decision = evaluate_safety(
@@ -1436,6 +1795,10 @@ def cmd_trade_safety(args: argparse.Namespace) -> int:
                 trade_request=trade_request,
                 order_type=order_type,
                 limit_price=limit_price,
+                position_id=int(position_id) if position_id not in (None, "") else None,
+                close_mode=close_mode,
+                close_amount=Decimal(str(close_amount_s)) if close_amount_s not in (None, "") else None,
+                close_percent=Decimal(str(close_percent_s)) if close_percent_s not in (None, "") else None,
                 max_plan_age_minutes=int(getattr(args, "max_age_minutes", 60)),
                 max_price_drift_warning_pct=Decimal(str(getattr(args, "price_drift_warn_pct", "1.0"))),
                 max_price_drift_unsafe_pct=Decimal(str(getattr(args, "price_drift_unsafe_pct", "3.0"))),
@@ -1456,12 +1819,13 @@ def cmd_trade_safety(args: argparse.Namespace) -> int:
         except Exception:
             details_json = None
 
+        side = "sell" if order_type.endswith("_SELL") else "buy"
         candidate_id = state.create_execution_candidate(
             trade_plan_id=int(plan.get("id")),
             trade_request_id=tr_id,
             request_id=plan.get("request_id"),
             symbol=str(plan.get("symbol") or ""),
-            side="buy",
+            side=side,
             order_type=order_type,
             limit_price=str(limit_price) if limit_price is not None else None,
             execution_environment=str(plan.get("execution_environment") or ""),
@@ -1481,8 +1845,12 @@ def cmd_trade_safety(args: argparse.Namespace) -> int:
     print(f"- Result: {decision.category}")
     print(f"- Validation: {decision.validation_status}")
     print(f"- Risk: {decision.risk_status}")
-    print(f"- Approved Budget: {decision.approved_budget_amount} {decision.approved_budget_asset}")
-    print(f"- Approved Quantity: {decision.approved_quantity}")
+    if str(getattr(args, "order_type", "")).strip().upper().endswith("_SELL"):
+        print(f"- Approved Quantity: {decision.approved_quantity}")
+        print(f"- Estimated Proceeds: {decision.approved_budget_amount} {decision.approved_budget_asset}")
+    else:
+        print(f"- Approved Budget: {decision.approved_budget_amount} {decision.approved_budget_asset}")
+        print(f"- Approved Quantity: {decision.approved_quantity}")
     if decision.warnings:
         print("- Warnings:")
         for w in decision.warnings:
@@ -1503,6 +1871,9 @@ def cmd_trade_execute(args: argparse.Namespace) -> int:
     db_path = ensure_db_initialized(config_path=config_path, db_path=paths.db_path)
 
     runtime_env = "testnet" if cfg.binance_testnet else "mainnet"
+
+    post_sync_bal: object | None = None
+    post_sync_oo: object | None = None
 
     with connect(db_path) as conn:
         state = StateManager(conn)
@@ -1561,11 +1932,11 @@ def cmd_trade_execute(args: argparse.Namespace) -> int:
 
         order_type = str(cand.get("order_type") or "").strip().upper()
         limit_price = cand.get("limit_price")
-        if order_type not in ("MARKET_BUY", "LIMIT_BUY"):
+        if order_type not in ("MARKET_BUY", "LIMIT_BUY", "MARKET_SELL", "LIMIT_SELL"):
             print(f"Rejected: invalid order_type={order_type}")
             return 2
-        if order_type == "LIMIT_BUY" and (limit_price in (None, "")):
-            print("Rejected: LIMIT_BUY requires limit_price in candidate")
+        if order_type in ("LIMIT_BUY", "LIMIT_SELL") and (limit_price in (None, "")):
+            print(f"Rejected: {order_type} requires limit_price in candidate")
             return 2
 
         # Confirmation prompt (unless --yes).
@@ -1573,17 +1944,26 @@ def cmd_trade_execute(args: argparse.Namespace) -> int:
             budget_amt = cand.get("approved_budget_amount")
             budget_asset = cand.get("approved_budget_asset")
             sym = cand.get("symbol")
+            side = str(cand.get("side") or "").strip().upper() or ("SELL" if order_type.endswith("_SELL") else "BUY")
             print("Execution Summary")
             print(f"- Candidate ID: {cand.get('id')}")
             print(f"- Plan ID: {plan_id}")
             print(f"- Symbol: {sym}")
-            print(f"- Side: BUY")
+            print(f"- Side: {side}")
             if order_type == "MARKET_BUY":
                 print(f"- Type: MARKET BUY (quoteOrderQty)")
-            else:
+            elif order_type == "LIMIT_BUY":
                 print(f"- Type: LIMIT BUY (GTC)")
                 print(f"- Limit Price: {limit_price}")
-            print(f"- Approved Budget: {budget_amt} {budget_asset}")
+            elif order_type == "MARKET_SELL":
+                print(f"- Type: MARKET SELL (quantity)")
+            else:
+                print(f"- Type: LIMIT SELL (GTC)")
+                print(f"- Limit Price: {limit_price}")
+            if order_type.endswith("_BUY"):
+                print(f"- Approved Budget: {budget_amt} {budget_asset}")
+            else:
+                print(f"- Approved Quantity: {cand.get('approved_quantity')}")
             print(f"- Environment: {runtime_env}")
             if not _prompt_yes_no("Execute now?", default=False):
                 print("Cancelled")
@@ -1599,8 +1979,26 @@ def cmd_trade_execute(args: argparse.Namespace) -> int:
                     rules_snapshot=rules_snapshot,
                     runtime_environment=runtime_env,
                 )
-            else:
+            elif order_type == "LIMIT_BUY":
                 execution_id, outcome = execute_limit_buy(
+                    execution_client=client,
+                    state=state,
+                    candidate=cand,
+                    plan=plan,
+                    rules_snapshot=rules_snapshot,
+                    runtime_environment=runtime_env,
+                )
+            elif order_type == "MARKET_SELL":
+                execution_id, outcome = execute_market_sell_qty(
+                    execution_client=client,
+                    state=state,
+                    candidate=cand,
+                    plan=plan,
+                    rules_snapshot=rules_snapshot,
+                    runtime_environment=runtime_env,
+                )
+            else:
+                execution_id, outcome = execute_limit_sell(
                     execution_client=client,
                     state=state,
                     candidate=cand,
@@ -1612,6 +2010,17 @@ def cmd_trade_execute(args: argparse.Namespace) -> int:
             state.append_audit(level="ERROR", event="execution_failed", details={"candidate_id": int(args.candidate_id), "error": str(e)})
             print(f"ERROR: {e}")
             return 2
+
+        # Post-trade resync (best-effort): refresh cached balances + open orders.
+        try:
+            post_sync_bal = sync_balances(client=client, conn=conn)
+        except Exception:
+            post_sync_bal = None
+        try:
+            sym = str(cand.get("symbol") or "").strip().upper() or None
+            post_sync_oo = sync_open_orders(client=client, conn=conn, symbol=sym)
+        except Exception:
+            post_sync_oo = None
 
     print("Execution Result")
     print(f"- Execution ID: {execution_id}")
@@ -1625,13 +2034,26 @@ def cmd_trade_execute(args: argparse.Namespace) -> int:
         print(f"- Executed Qty: {outcome.fills.executed_qty}")
         if outcome.fills.avg_fill_price is not None:
             print(f"- Avg Fill Price: {outcome.fills.avg_fill_price}")
-        print(f"- Total Quote Spent: {outcome.fills.total_quote_spent}")
+        if str(cand.get('side') or '').strip().lower() == "sell":
+            print(f"- Total Quote Received: {outcome.fills.total_quote_spent}")
+        else:
+            print(f"- Total Quote Spent: {outcome.fills.total_quote_spent}")
         print(f"- Fills Count: {outcome.fills.fills_count}")
         if outcome.fills.commission_asset and outcome.fills.commission_total is not None:
             print(f"- Commission: {outcome.fills.commission_total} {outcome.fills.commission_asset}")
         elif outcome.fills.commission_asset:
             print(f"- Commission: {outcome.fills.commission_asset} (see audit for breakdown)")
     print(f"- Message: {outcome.message}")
+    if post_sync_bal is not None:
+        try:
+            print(f"- Post-sync balances: {post_sync_bal.status}")
+        except Exception:
+            pass
+    if post_sync_oo is not None:
+        try:
+            print(f"- Post-sync open orders: {post_sync_oo.status} seen={post_sync_oo.open_orders_seen}")
+        except Exception:
+            pass
     return 0 if outcome.local_status in ("filled", "submitted", "partially_filled") else 2
 
 
@@ -1703,6 +2125,10 @@ def cmd_trade_executions_show(args: argparse.Namespace) -> int:
         "total_quote_spent",
         "commission_total",
         "commission_asset",
+        "fee_breakdown_json",
+        "realized_pnl_quote",
+        "realized_pnl_quote_asset",
+        "pnl_warnings_json",
         "fills_count",
         "local_status",
         "raw_status",
@@ -1732,8 +2158,8 @@ def cmd_trade_execution_cancel(args: argparse.Namespace) -> int:
             print("(not found)")
             return 2
 
-        if str(row.get("order_type") or "").strip().upper() != "LIMIT_BUY":
-            print("Not supported: only LIMIT_BUY executions can be cancelled in MVP.")
+        if str(row.get("order_type") or "").strip().upper() not in ("LIMIT_BUY", "LIMIT_SELL"):
+            print("Not supported: only LIMIT_BUY / LIMIT_SELL executions can be cancelled.")
             return 2
 
         if str(row.get("local_status") or "") in ("filled", "cancelled", "expired", "failed", "rejected"):
@@ -1805,7 +2231,151 @@ def cmd_trade_execution_cancel(args: argparse.Namespace) -> int:
     return 0
 
 
-def cmd_trade_reconcile(args: argparse.Namespace) -> int:
+@contextlib.contextmanager
+def _cbreak_stdin():
+    if not (sys.stdin.isatty() and sys.stdout.isatty()):
+        yield
+        return
+    fd = sys.stdin.fileno()
+    old = termios.tcgetattr(fd)
+    try:
+        tty.setcbreak(fd)
+        yield
+    finally:
+        termios.tcsetattr(fd, termios.TCSADRAIN, old)
+
+
+def _sleep_with_ctrl_b(
+    *,
+    seconds: float,
+    end_at: float | None,
+    base_line: str | None = None,
+    show_countdown: bool = True,
+) -> bool:
+    """
+    Returns True if stop was requested (Ctrl-B), otherwise False.
+    """
+    stop_key = "\x02"  # Ctrl-B
+    deadline = (time.monotonic() + seconds) if end_at is None else min(end_at, time.monotonic() + seconds)
+    spinner = ["|", "/", "-", "\\"]
+    spin_i = 0
+
+    def _tty_write(text: str) -> None:
+        # Clear the line to avoid leftover characters on terminals/loggers that don't honor plain '\r'.
+        sys.stdout.write("\r\x1b[2K" + text)
+        sys.stdout.flush()
+    while True:
+        if end_at is not None and time.monotonic() >= end_at:
+            return False
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return False
+        if not sys.stdin.isatty():
+            time.sleep(min(0.5, remaining))
+            continue
+        if show_countdown:
+            # Keep the UI "alive" during sleep without leaving remnants.
+            try:
+                s = int(max(0, remaining))
+                ch = spinner[spin_i % len(spinner)]
+                spin_i += 1
+                suffix = f"{ch} t-{s:>2}s (Ctrl-B)"
+                prefix = ""
+                if base_line:
+                    cols = 120
+                    try:
+                        cols = int(shutil.get_terminal_size((120, 20)).columns)
+                    except Exception:
+                        cols = 120
+                    max_prefix = max(0, cols - len(suffix))
+                    short = base_line
+                    if len(short) > max_prefix and max_prefix > 3:
+                        short = short[: max_prefix - 3] + "..."
+                    prefix = short + "  "
+                _tty_write(prefix + suffix)
+            except Exception:
+                pass
+        r, _, _ = select.select([sys.stdin], [], [], min(1.0, remaining))
+        if r:
+            ch = sys.stdin.read(1)
+            if ch == stop_key:
+                return True
+
+
+def _reconcile_open_orders_batch(
+    *,
+    client: BinanceSpotClient,
+    state: StateManager,
+    limit: int = 200,
+    per_order_pause_s: float = 0.5,
+    end_at: float | None = None,
+    progress_line: callable | None = None,
+    order_source: str | None = None,
+) -> tuple[int, int]:
+    """
+    Reconcile *all currently open* orders (orders table NEW/PARTIALLY_FILLED)
+    by calling GET /api/v3/order (orderId) one-by-one and upserting the latest fields.
+
+    Returns: (open_total, errors)
+    """
+    if order_source:
+        rows = state.list_open_orders_for_reconcile_by_source(order_source=order_source, limit=limit)
+    else:
+        rows = state.list_open_orders_for_reconcile(limit=limit)
+    open_orders = [
+        (str(r.get("symbol") or "").strip().upper(), str(r.get("exchange_order_id") or "").strip())
+        for r in rows
+        if str(r.get("symbol") or "").strip() and str(r.get("exchange_order_id") or "").strip()
+    ]
+    total = len(open_orders)
+    errors = 0
+
+    for i, (symbol, order_id) in enumerate(open_orders, start=1):
+        if progress_line:
+            try:
+                progress_line(i, total)
+            except Exception:
+                pass
+        try:
+            order = client.get_order_by_order_id(symbol=symbol, order_id=order_id)
+
+            def _iso_ms(v: object) -> str:
+                try:
+                    j = int(v)  # ms
+                except Exception:
+                    j = 0
+                return ms_to_utc_iso(j) if j else utcnow_iso()
+
+            row = OrderRow(
+                exchange_order_id=str(order.get("orderId")) if order.get("orderId") is not None else order_id,
+                symbol=str(order.get("symbol") or symbol),
+                side=str(order.get("side") or ""),
+                type=str(order.get("type") or ""),
+                status=str(order.get("status") or ""),
+                time_in_force=str(order.get("timeInForce")) if order.get("timeInForce") is not None else None,
+                price=str(order.get("price")) if order.get("price") is not None else None,
+                quantity=str(order.get("origQty") or "0"),
+                filled_quantity=str(order.get("executedQty") or "0"),
+                executed_quantity=str(order.get("executedQty") or "0"),
+                created_at_utc=_iso_ms(order.get("time")),
+                updated_at_utc=_iso_ms(order.get("updateTime") or order.get("time")),
+            )
+            state.upsert_orders([row])
+        except Exception:
+            errors += 1
+
+        # Fixed delay between orders (rate-limit friendly). If Ctrl-B is available, allow immediate stop.
+        if per_order_pause_s > 0:
+            if sys.stdin.isatty() and sys.stdout.isatty():
+                if _sleep_with_ctrl_b(seconds=float(per_order_pause_s), end_at=end_at, base_line=None, show_countdown=False):
+                    break
+            else:
+                time.sleep(float(per_order_pause_s))
+
+    return total, errors
+
+
+def _trade_reconcile_once(args: argparse.Namespace, *, quiet: bool = False) -> tuple[int, dict]:
     client = _client_from_args(args)
     paths = ConfigPaths.from_cli(config_path=args.config, db_path=args.db)
     config_path = ensure_default_config(paths.config_path)
@@ -1828,17 +2398,30 @@ def cmd_trade_reconcile(args: argparse.Namespace) -> int:
     expired = 0
     skipped = 0
     errors = 0
+    status_counts: dict[str, int] = {}
+    pre_status_counts: dict[str, int] = {}
+    post_sync_bal: object | None = None
+    post_sync_oo: object | None = None
+    oo_exec_total: int | None = None
+    oo_exec_errors: int = 0
+    oo_exec_tracked: int = 0
 
     with connect(db_path) as conn:
         state = StateManager(conn)
         rows = state.list_reconcilable_executions(limit=limit)
-        if not rows:
-            print("(no executions to reconcile)")
-            return 0
+        for r in rows:
+            ls = str(r.get("local_status") or "").strip()
+            if ls:
+                pre_status_counts[ls] = pre_status_counts.get(ls, 0) + 1
 
         now = datetime.now(UTC)
-        for r in rows:
+        # Small fixed pause between per-execution reconciliations to reduce rate-limit risk.
+        # Intentionally not user-configurable.
+        per_item_pause_s = 0.5
+        seen_exec_ids: set[int] = set()
+        for i, r in enumerate(rows, start=1):
             exec_id = int(r["execution_id"])
+            seen_exec_ids.add(exec_id)
             symbol = str(r.get("symbol") or "")
             client_order_id = str(r.get("client_order_id") or "")
             exec_env = str(r.get("execution_environment") or "").strip().lower()
@@ -1846,6 +2429,7 @@ def cmd_trade_reconcile(args: argparse.Namespace) -> int:
 
             if exec_env and exec_env != runtime_env:
                 skipped += 1
+                status_counts["skipped"] = status_counts.get("skipped", 0) + 1
                 state.append_audit(
                     level="WARN",
                     event="reconcile_skipped_env_mismatch",
@@ -1853,9 +2437,9 @@ def cmd_trade_reconcile(args: argparse.Namespace) -> int:
                 )
                 continue
 
-            # Timeout enforcement for LIMIT_BUY (local expire only).
+            # Timeout enforcement for LIMIT orders (local expire; optional cancel).
             submitted_at = r.get("submitted_at_utc")
-            if order_type == "LIMIT_BUY" and submitted_at:
+            if order_type in ("LIMIT_BUY", "LIMIT_SELL") and submitted_at:
                 try:
                     age = now - _parse_iso(str(submitted_at))
                     if age.total_seconds() >= timeout_min * 60:
@@ -1895,6 +2479,7 @@ def cmd_trade_reconcile(args: argparse.Namespace) -> int:
                         else:
                             state.mark_execution_expired(execution_id=exec_id, reason=f"limit_order_timeout_reached:{timeout_min}m")
                             expired += 1
+                            status_counts["expired"] = status_counts.get("expired", 0) + 1
                             continue
                 except Exception:
                     # If we can't parse time, fail closed by not expiring; reconciliation still runs.
@@ -1904,6 +2489,7 @@ def cmd_trade_reconcile(args: argparse.Namespace) -> int:
                 order = client.get_order_by_client_order_id(symbol=symbol, client_order_id=client_order_id)
             except BinanceAPIError as e:
                 errors += 1
+                status_counts["error"] = status_counts.get("error", 0) + 1
                 state.append_audit(level="ERROR", event="reconcile_failed", details={"execution_id": exec_id, "error": str(e)})
                 continue
 
@@ -1945,9 +2531,3850 @@ def cmd_trade_reconcile(args: argparse.Namespace) -> int:
                 reconciled_at_utc=utcnow_iso(),
             )
             updated += 1
+            status_counts[local_status] = status_counts.get(local_status, 0) + 1
+            if i < len(rows):
+                time.sleep(per_item_pause_s)
 
-    print(f"OK reconciled updated={updated} expired={expired} skipped={skipped} errors={errors}")
-    return 0 if errors == 0 else 2
+        # Post-reconcile resync (best-effort): refresh cached balances + open orders.
+        try:
+            post_sync_bal = sync_balances(client=client, conn=conn)
+        except Exception:
+            post_sync_bal = None
+        try:
+            post_sync_oo = sync_open_orders(client=client, conn=conn, symbol=None)
+        except Exception:
+            post_sync_oo = None
+
+        # Reconcile *execution-sourced* open orders (from orders cache).
+        # This is important when an execution row was locally marked expired but the exchange order is still NEW.
+        try:
+            open_exec_orders = state.list_open_orders_for_reconcile_by_source(order_source="execution", limit=200)
+            oo_exec_total = len(open_exec_orders)
+            for j, o in enumerate(open_exec_orders, start=1):
+                oo_exec_tracked = j
+                order_id = str(o.get("exchange_order_id") or "").strip()
+                sym = str(o.get("symbol") or "").strip().upper()
+                if not (order_id and sym):
+                    continue
+                ex = state.get_execution_by_binance_order_id(binance_order_id=order_id)
+                if not ex:
+                    continue
+                exec_id = int(ex.get("execution_id") or 0)
+                if exec_id in seen_exec_ids:
+                    continue
+                seen_exec_ids.add(exec_id)
+
+                exec_env = str(ex.get("execution_environment") or "").strip().lower()
+                if exec_env and exec_env != runtime_env:
+                    skipped += 1
+                    status_counts["skipped"] = status_counts.get("skipped", 0) + 1
+                    continue
+
+                client_order_id = str(ex.get("client_order_id") or "").strip()
+                order_type = str(ex.get("order_type") or "").strip().upper()
+                submitted_at = ex.get("submitted_at_utc")
+
+                # If it's a LIMIT order and it exceeded timeout, cancel on Binance by default.
+                if order_type in ("LIMIT_BUY", "LIMIT_SELL") and submitted_at:
+                    try:
+                        age = now - _parse_iso(str(submitted_at))
+                        if age.total_seconds() >= timeout_min * 60 and auto_cancel:
+                            try:
+                                client.cancel_order_by_client_order_id(symbol=sym, client_order_id=client_order_id)
+                            except Exception:
+                                oo_exec_errors += 1
+                    except Exception:
+                        pass
+
+                try:
+                    order = client.get_order_by_client_order_id(symbol=sym, client_order_id=client_order_id)
+                except Exception:
+                    oo_exec_errors += 1
+                    continue
+
+                raw_status = str(order.get("status") or "") or None
+                order_id2 = str(order.get("orderId") or "") or None
+                fills = None
+                try:
+                    fills = parse_fills(order)
+                except Exception:
+                    fills = None
+
+                local_status = "submitted"
+                if raw_status in ("NEW",):
+                    local_status = "open"
+                elif raw_status == "FILLED":
+                    local_status = "filled"
+                elif raw_status == "PARTIALLY_FILLED":
+                    local_status = "partially_filled"
+                elif raw_status in ("CANCELED", "CANCELLED"):
+                    local_status = "cancelled"
+                elif raw_status in ("EXPIRED",):
+                    local_status = "expired"
+
+                state.update_execution(
+                    execution_id=exec_id,
+                    local_status=local_status,
+                    raw_status=raw_status,
+                    binance_order_id=order_id2,
+                    executed_quantity=str(fills.executed_qty) if fills else None,
+                    avg_fill_price=str(fills.avg_fill_price) if fills and fills.avg_fill_price is not None else None,
+                    total_quote_spent=str(fills.total_quote_spent) if fills else None,
+                    commission_total=str(fills.commission_total) if fills and fills.commission_total is not None else None,
+                    commission_asset=(fills.commission_asset if fills else None),
+                    fills_count=(fills.fills_count if fills else None),
+                    retry_count=int(ex.get("retry_count") or 0),
+                    message="reconciled_open_execution_order",
+                    details_json=None,
+                    submitted_at_utc=str(ex.get("submitted_at_utc") or "") or None,
+                    reconciled_at_utc=utcnow_iso(),
+                )
+                updated += 1
+                status_counts[local_status] = status_counts.get(local_status, 0) + 1
+                if j < len(open_exec_orders):
+                    time.sleep(per_item_pause_s)
+        except Exception:
+            oo_exec_total = None
+
+    open_orders_seen = None
+    if post_sync_oo is not None:
+        try:
+            open_orders_seen = int(post_sync_oo.open_orders_seen)
+        except Exception:
+            open_orders_seen = None
+
+    stats = {
+        "updated": updated,
+        "expired": expired,
+        "skipped": skipped,
+        "errors": errors,
+        "status_counts": status_counts,
+        "pre_status_counts": pre_status_counts,
+        "open_orders_seen": open_orders_seen,
+        "open_exec_total": oo_exec_total,
+        "open_exec_errors": oo_exec_errors,
+        "open_exec_tracked": oo_exec_tracked,
+    }
+
+    if not quiet:
+        msg = f"OK reconciled updated={updated} expired={expired} skipped={skipped} errors={errors}"
+        if post_sync_bal is not None:
+            try:
+                msg += f" balances={post_sync_bal.status}"
+            except Exception:
+                pass
+        if post_sync_oo is not None:
+            try:
+                msg += f" open_orders={post_sync_oo.status}({post_sync_oo.open_orders_seen})"
+            except Exception:
+                pass
+        print(msg)
+
+    return (0 if errors == 0 else 2), stats
+
+
+def cmd_trade_reconcile(args: argparse.Namespace) -> int:
+    if not getattr(args, "loop", False):
+        rc, _ = _trade_reconcile_once(args, quiet=False)
+        return rc
+    interval = int(getattr(args, "interval_seconds", 60))
+    duration = getattr(args, "duration_seconds", None)
+    end_at = None
+    if duration not in (None, ""):
+        end_at = time.monotonic() + int(duration)
+    print("Reconcile loop started. Press Ctrl-B or Ctrl-C to stop.")
+    with _cbreak_stdin():
+        try:
+            while True:
+                rc, stats = _trade_reconcile_once(args, quiet=True)
+                exec_open_total = stats.get("open_exec_total")
+                if exec_open_total is None:
+                    # Fallback to exchange open order count when we can't compute execution-specific open count.
+                    exec_open_total = stats.get("open_orders_seen")
+                exec_open_total_i = int(exec_open_total or 0)
+                exec_open_err_i = int(stats.get("open_exec_errors", 0) or 0)
+                exec_open_tracked_i = int(stats.get("open_exec_tracked", 0) or 0)
+                pre = stats.get("pre_status_counts") or {}
+                open_n = int(pre.get("open", 0))
+                partial_n = int(pre.get("partially_filled", 0))
+                uncertain_n = int(pre.get("uncertain_submitted", 0))
+                submitted_n = int(pre.get("submitted", 0))
+                sc = stats.get("status_counts") or {}
+                filled_n = int(sc.get("filled", 0))
+                cancelled_n = int(sc.get("cancelled", 0))
+                expired_n = int(sc.get("expired", 0)) + int(stats.get("expired", 0))
+                oo_seen = stats.get("open_orders_seen")
+                oo_s = f" oo={oo_seen}" if oo_seen is not None else ""
+                line = (
+                    f"reconcile: exec_open={exec_open_total_i} tracked_open={exec_open_tracked_i}/{exec_open_total_i} "
+                    f"open={open_n} submitted={submitted_n} partial={partial_n} "
+                    f"uncertain={uncertain_n} filled={filled_n} cancelled={cancelled_n} expired={expired_n} "
+                    f"updated={stats.get('updated', 0)} errors={int(stats.get('errors', 0) or 0) + exec_open_err_i}{oo_s}"
+                )
+                if sys.stdout.isatty():
+                    sys.stdout.write("\r\x1b[2K" + line)
+                    sys.stdout.flush()
+                else:
+                    print(line)
+                active_n = open_n + submitted_n + partial_n + uncertain_n
+                if active_n == 0 and exec_open_total_i == 0:
+                    if sys.stdout.isatty():
+                        print()
+                    print("Stopped (no active executions)")
+                    return 0
+                if end_at is not None and time.monotonic() >= end_at:
+                    if sys.stdout.isatty():
+                        print()
+                    print("Done")
+                    return rc
+                if _sleep_with_ctrl_b(seconds=float(interval), end_at=end_at, base_line=line, show_countdown=True):
+                    if sys.stdout.isatty():
+                        print()
+                    print("Stopped")
+                    return rc
+        except KeyboardInterrupt:
+            if sys.stdout.isatty():
+                print()
+            print("Stopped")
+            return 0
+
+
+def _d_position(value: object, name: str) -> Decimal:
+    try:
+        d = Decimal(str(value))
+    except Exception as e:
+        raise ValueError(f"Invalid decimal for {name}") from e
+    if d.is_nan() or d.is_infinite():
+        raise ValueError(f"Invalid decimal for {name}")
+    return d
+
+
+def _price_client_for_market_env(*, cfg, market_env: str, ca_bundle: Path | None, insecure: bool) -> BinanceSpotClient:
+    env = (market_env or "").strip().lower()
+    if env not in ("mainnet_public", "testnet"):
+        env = "mainnet_public"
+    base_url = "https://api.binance.com" if env == "mainnet_public" else "https://testnet.binance.vision"
+    client = BinanceSpotClient.from_config(cfg)
+    client = BinanceSpotClient(**{**client.__dict__, "base_url": base_url, "api_key": None, "api_secret": None})
+    if ca_bundle:
+        client = BinanceSpotClient(**{**client.__dict__, "ca_bundle_path": ca_bundle.expanduser(), "tls_verify": True})
+    if insecure:
+        client = BinanceSpotClient(**{**client.__dict__, "tls_verify": False})
+    return client
+
+
+def cmd_position_list(args: argparse.Namespace) -> int:
+    paths = ConfigPaths.from_cli(config_path=args.config, db_path=args.db)
+    config_path = ensure_default_config(paths.config_path)
+    db_path = ensure_db_initialized(config_path=config_path, db_path=paths.db_path)
+    status = getattr(args, "status", None)
+    limit = int(getattr(args, "limit", 50))
+    with connect(db_path) as conn:
+        rows = StateManager(conn).list_positions(status=status, limit=limit)
+    if not rows:
+        print("(no positions)")
+        return 0
+    print(f"Positions: {len(rows)}")
+    print(f"{'POS_ID':>6} {'STATUS':<8} {'SYMBOL':<10} {'QTY':<14} {'ENTRY':<14} {'MD_ENV':<13} {'EXEC_ENV':<7}")
+    for r in rows:
+        print(
+            f"{int(r.get('id') or 0):>6} "
+            f"{str(r.get('status') or '-'): <8} "
+            f"{str(r.get('symbol') or '-'): <10} "
+            f"{str(r.get('quantity') or '-'): <14} "
+            f"{str(r.get('entry_price') or '-'): <14} "
+            f"{str(r.get('market_data_environment') or '-'): <13} "
+            f"{str(r.get('execution_environment') or '-'): <7}"
+        )
+    return 0
+
+
+def cmd_position_show(args: argparse.Namespace) -> int:
+    paths = ConfigPaths.from_cli(config_path=args.config, db_path=args.db)
+    config_path = ensure_default_config(paths.config_path)
+    cfg = load_config(config_path)
+    db_path = ensure_db_initialized(config_path=config_path, db_path=paths.db_path)
+
+    md_env = "mainnet_public"
+    current_price = Decimal("0")
+    entry_price = Decimal("0")
+    qty = Decimal("0")
+    market_value = Decimal("0")
+    cost_basis = Decimal("0")
+    unrealized = Decimal("0")
+    pnl_pct = Decimal("0")
+
+    with connect(db_path) as conn:
+        state = StateManager(conn)
+        pos = state.get_position(position_id=int(args.position_id))
+        if not pos:
+            print("(not found)")
+            return 2
+
+        for k in [
+            "id",
+            "symbol",
+            "status",
+            "market_data_environment",
+            "execution_environment",
+            "entry_price",
+            "quantity",
+            "stop_loss_price",
+            "profit_target_price",
+            "deadline_utc",
+            "opened_at_utc",
+            "closed_at_utc",
+            "last_monitored_at_utc",
+            "created_at_utc",
+            "updated_at_utc",
+        ]:
+            print(f"{k}={pos.get(k)}")
+
+        if str(pos.get("status") or "").upper() != "OPEN":
+            return 0
+        if not getattr(args, "live", False):
+            return 0
+
+        symbol = str(pos.get("symbol") or "").strip().upper()
+        md_env = str(pos.get("market_data_environment") or "mainnet_public")
+        client = _price_client_for_market_env(
+            cfg=cfg,
+            market_env=md_env,
+            ca_bundle=getattr(args, "ca_bundle", None),
+            insecure=bool(getattr(args, "insecure", False)),
+        )
+
+        current_price = _d_position(client.get_ticker_price(symbol=symbol), "current_price")
+        entry_price = _d_position(pos.get("entry_price"), "entry_price")
+        qty = _d_position(pos.get("quantity"), "net_position_qty")
+
+        market_value = current_price * qty
+        cost_basis = entry_price * qty
+        unrealized = market_value - cost_basis
+        pnl_pct = (unrealized / cost_basis * Decimal("100")) if cost_basis > 0 else Decimal("0")
+
+        state.update_position_last_monitored(position_id=int(pos["id"]), at_utc=utcnow_iso())
+
+    print("Unrealized PnL")
+    print(f"- Price Env: {md_env}")
+    print(f"- Current Price: {current_price}")
+    print(f"- Net Qty: {qty}")
+    print(f"- Market Value: {market_value}")
+    print(f"- Cost Basis: {cost_basis}")
+    print(f"- Unrealized PnL: {unrealized}")
+    print(f"- PnL %: {pnl_pct}")
+    return 0
+
+
+def _monitor_once_core(args: argparse.Namespace) -> tuple[int, int, int, int, list[int], list[int]]:
+    paths = ConfigPaths.from_cli(config_path=args.config, db_path=args.db)
+    config_path = ensure_default_config(paths.config_path)
+    cfg = load_config(config_path)
+    db_path = ensure_db_initialized(config_path=config_path, db_path=paths.db_path)
+
+    limit = int(getattr(args, "limit", 50))
+    position_id = getattr(args, "position_id", None)
+    verbose = bool(getattr(args, "verbose", False))
+    checked = 0
+    exit_recommended = 0
+    reevaluate = 0
+    paused = 0
+    checked_positions: list[int] = []
+    failed_positions: list[int] = []
+
+    with connect(db_path) as conn:
+        state = StateManager(conn)
+        if position_id not in (None, ""):
+            pos = state.get_position(position_id=int(position_id))
+            if not pos:
+                print("(not found)")
+                return (0, 0, 0, 0, [], [])
+            if str(pos.get("status") or "").upper() != "OPEN":
+                print("Rejected: position is not OPEN")
+                return (0, 0, 0, 0, [], [])
+            positions = [pos]
+        else:
+            positions = state.list_positions(status="OPEN", limit=limit)
+        if not positions:
+            print("(no open positions)")
+            return (0, 0, 0, 0, [], [])
+
+        for pos in positions:
+            checked += 1
+            pos_id = int(pos.get("id") or 0)
+            checked_positions.append(pos_id)
+            symbol = str(pos.get("symbol") or "").strip().upper()
+            md_env = str(pos.get("market_data_environment") or "mainnet_public")
+
+            try:
+                client = _price_client_for_market_env(
+                    cfg=cfg,
+                    market_env=md_env,
+                    ca_bundle=getattr(args, "ca_bundle", None),
+                    insecure=bool(getattr(args, "insecure", False)),
+                )
+
+                # Prefer server time for deadline comparisons.
+                now_dt = datetime.now(UTC)
+                try:
+                    ms = client.get_server_time_ms()
+                    now_dt = datetime.fromtimestamp(ms / 1000.0, tz=UTC)
+                except Exception:
+                    pass
+
+                current_price = _d_position(client.get_ticker_price(symbol=symbol), "current_price")
+                entry_price = _d_position(pos.get("entry_price"), "entry_price")
+                qty = _d_position(pos.get("quantity"), "net_position_qty")
+
+                market_value = current_price * qty
+                cost_basis = entry_price * qty
+                unrealized = market_value - cost_basis
+                pnl_pct = (unrealized / cost_basis * Decimal("100")) if cost_basis > 0 else Decimal("0")
+
+                decision = "hold"
+                exit_reason = None
+
+                # Deadline exit
+                deadline_utc_s = str(pos.get("deadline_utc") or "").strip()
+                if deadline_utc_s:
+                    try:
+                        deadline_dt = datetime.fromisoformat(deadline_utc_s.replace("Z", "+00:00")).astimezone(UTC)
+                        if now_dt >= deadline_dt:
+                            decision = "exit_recommended"
+                            exit_reason = "deadline_reached"
+                    except Exception:
+                        pass
+
+                # Stop-loss / take-profit (only if not already exit-triggered)
+                if decision == "hold":
+                    try:
+                        sl = _d_position(pos.get("stop_loss_price"), "stop_loss_price")
+                        if sl > 0 and current_price <= sl:
+                            decision = "exit_recommended"
+                            exit_reason = "stop_loss_hit"
+                    except Exception:
+                        pass
+                if decision == "hold":
+                    try:
+                        tp = _d_position(pos.get("profit_target_price"), "profit_target_price")
+                        if tp > 0 and current_price >= tp:
+                            decision = "exit_recommended"
+                            exit_reason = "target_reached"
+                    except Exception:
+                        pass
+
+                # Re-evaluation triggers (only if not exit)
+                if decision == "hold":
+                    # Soft deadline (within 10% of remaining time or 10 minutes, whichever is larger).
+                    try:
+                        opened_s = str(pos.get("opened_at_utc") or "").strip()
+                        if deadline_utc_s and opened_s:
+                            opened_dt = datetime.fromisoformat(opened_s.replace("Z", "+00:00")).astimezone(UTC)
+                            deadline_dt = datetime.fromisoformat(deadline_utc_s.replace("Z", "+00:00")).astimezone(UTC)
+                            total = (deadline_dt - opened_dt).total_seconds()
+                            remaining = (deadline_dt - now_dt).total_seconds()
+                            if total > 0 and remaining > 0:
+                                soft_window = max(600.0, total * 0.10)
+                                if remaining <= soft_window:
+                                    decision = "reevaluate"
+                                    exit_reason = "soft_deadline_reached"
+                    except Exception:
+                        pass
+
+                if decision == "hold":
+                    # Profit threshold near target (>= 90% of target price).
+                    try:
+                        tp = _d_position(pos.get("profit_target_price"), "profit_target_price")
+                        if tp > 0 and current_price >= (tp * Decimal("0.90")):
+                            decision = "reevaluate"
+                            exit_reason = "profit_threshold_reached"
+                    except Exception:
+                        pass
+
+                if decision == "hold":
+                    # Drawdown warning near stop-loss (<= 110% of stop-loss price).
+                    try:
+                        sl = _d_position(pos.get("stop_loss_price"), "stop_loss_price")
+                        if sl > 0 and current_price <= (sl * Decimal("1.10")):
+                            decision = "reevaluate"
+                            exit_reason = "drawdown_warning"
+                    except Exception:
+                        pass
+
+                if decision == "exit_recommended":
+                    exit_recommended += 1
+                elif decision == "reevaluate":
+                    reevaluate += 1
+
+                if verbose:
+                    print(
+                        f"pos_id={pos_id} symbol={symbol} md_env={md_env} price={current_price} "
+                        f"qty={qty} entry={entry_price} pnl_pct={pnl_pct} decision={decision}"
+                    )
+
+                state.create_monitoring_event(
+                    position_id=pos_id,
+                    symbol=symbol,
+                    entry_price=str(entry_price),
+                    current_price=str(current_price),
+                    pnl_percent=str(pnl_pct),
+                    decision=decision,
+                    exit_reason=exit_reason,
+                    deadline_utc=deadline_utc_s or None,
+                    position_status=str(pos.get("status") or ""),
+                    error_code=None,
+                    error_message=None,
+                )
+                state.update_position_last_monitored(position_id=pos_id, at_utc=utcnow_iso())
+            except Exception as e:
+                paused += 1
+                failed_positions.append(pos_id)
+                if verbose:
+                    print(f"pos_id={pos_id} symbol={symbol} md_env={md_env} decision=data_unavailable error={e}")
+                state.create_monitoring_event(
+                    position_id=pos_id,
+                    symbol=symbol,
+                    entry_price=str(pos.get("entry_price") or "") or None,
+                    current_price=None,
+                    pnl_percent=None,
+                    decision="data_unavailable",
+                    exit_reason="monitoring_fetch_failed",
+                    deadline_utc=str(pos.get("deadline_utc") or "") or None,
+                    position_status=str(pos.get("status") or ""),
+                    error_code="monitoring_fetch_failed",
+                    error_message=str(e),
+                )
+
+    return (checked, exit_recommended, reevaluate, paused, checked_positions, failed_positions)
+
+
+def cmd_monitor_once(args: argparse.Namespace) -> int:
+    checked, exit_recommended, reevaluate, paused, _, _ = _monitor_once_core(args)
+    if checked == 0 and exit_recommended == 0 and reevaluate == 0 and paused == 0:
+        return 0
+    print(f"OK checked={checked} exit_recommended={exit_recommended} reevaluate={reevaluate} paused={paused}")
+    return 0
+
+
+def _resolve_monitor_interval_seconds(*, args: argparse.Namespace, cfg: AppConfig) -> tuple[int, str]:
+    fallback = 60
+    cli_val = getattr(args, "interval_seconds", None)
+    if cli_val not in (None, ""):
+        try:
+            v = int(cli_val)
+            if v > 0:
+                return v, "cli"
+        except Exception:
+            pass
+    cfg_val = getattr(cfg, "trading_monitoring_interval_seconds", None)
+    try:
+        if cfg_val is not None and int(cfg_val) > 0:
+            return int(cfg_val), "config"
+    except Exception:
+        pass
+    return fallback, "fallback"
+
+
+def cmd_monitor_loop(args: argparse.Namespace) -> int:
+    paths = ConfigPaths.from_cli(config_path=args.config, db_path=args.db)
+    config_path = ensure_default_config(paths.config_path)
+    cfg = load_config(config_path)
+
+    interval, source = _resolve_monitor_interval_seconds(args=args, cfg=cfg)
+    duration = getattr(args, "duration_seconds", None)
+    if interval <= 0:
+        print("Invalid interval_seconds")
+        return 2
+    end_at = None
+    if duration not in (None, ""):
+        try:
+            duration_s = int(duration)
+        except Exception:
+            print("Invalid duration_seconds")
+            return 2
+        if duration_s <= 0:
+            print("Invalid duration_seconds")
+            return 2
+        end_at = time.monotonic() + duration_s
+
+    extra = f", duration_seconds={int(duration)}" if end_at is not None else ""
+    print(f"Monitoring loop started (interval_seconds={interval}, source={source}{extra}). Ctrl-C to stop.")
+
+    consecutive_failures = 0
+    try:
+        while True:
+            if end_at is not None and time.monotonic() >= end_at:
+                break
+            checked, exit_recommended, reevaluate, paused, checked_positions, failed_positions = _monitor_once_core(args)
+            if checked == 0 and exit_recommended == 0 and reevaluate == 0 and paused == 0:
+                # No positions to monitor.
+                time.sleep(interval)
+                continue
+
+            had_failure = len(failed_positions) > 0
+            if had_failure:
+                consecutive_failures += 1
+                multiplier = 2 if consecutive_failures == 1 else 5
+                next_delay = interval * multiplier
+                print(f"monitoring_fetch_failed count={consecutive_failures} backoff_multiplier={multiplier} next_retry={next_delay}s")
+                # Persist backoff event for failed positions.
+                try:
+                    db_path = ensure_db_initialized(config_path=config_path, db_path=paths.db_path)
+                    with connect(db_path) as conn:
+                        state = StateManager(conn)
+                        for pid in failed_positions:
+                            try:
+                                pos = state.get_position(position_id=int(pid))
+                                if not pos:
+                                    continue
+                                state.create_monitoring_event(
+                                    position_id=int(pid),
+                                    symbol=str(pos.get("symbol") or "").strip().upper(),
+                                    entry_price=str(pos.get("entry_price") or "") or None,
+                                    current_price=None,
+                                    pnl_percent=None,
+                                    decision="data_unavailable",
+                                    exit_reason="monitoring_backoff_applied",
+                                    deadline_utc=str(pos.get("deadline_utc") or "") or None,
+                                    position_status=str(pos.get("status") or ""),
+                                    error_code="monitoring_backoff_applied",
+                                    error_message=f"backoff_multiplier={multiplier}",
+                                )
+                            except Exception:
+                                continue
+                except Exception:
+                    pass
+                sleep_s = next_delay
+            else:
+                if consecutive_failures > 0:
+                    print("monitoring_recovered")
+                    # Persist recovery event for checked positions.
+                    try:
+                        db_path = ensure_db_initialized(config_path=config_path, db_path=paths.db_path)
+                        with connect(db_path) as conn:
+                            state = StateManager(conn)
+                            for pid in checked_positions:
+                                try:
+                                    pos = state.get_position(position_id=int(pid))
+                                    if not pos:
+                                        continue
+                                    state.create_monitoring_event(
+                                        position_id=int(pid),
+                                        symbol=str(pos.get("symbol") or "").strip().upper(),
+                                        entry_price=str(pos.get("entry_price") or "") or None,
+                                        current_price=None,
+                                        pnl_percent=None,
+                                        decision="hold",
+                                        exit_reason="monitoring_recovered",
+                                        deadline_utc=str(pos.get("deadline_utc") or "") or None,
+                                        position_status=str(pos.get("status") or ""),
+                                        error_code="monitoring_recovered",
+                                        error_message=None,
+                                    )
+                                except Exception:
+                                    continue
+                    except Exception:
+                        pass
+                consecutive_failures = 0
+                sleep_s = interval
+
+            if end_at is None:
+                time.sleep(sleep_s)
+            else:
+                remaining = end_at - time.monotonic()
+                if remaining <= 0:
+                    break
+                time.sleep(min(sleep_s, remaining))
+    except KeyboardInterrupt:
+        print("Stopped")
+        return 0
+    print("Done")
+    return 0
+
+
+def cmd_monitor_events_list(args: argparse.Namespace) -> int:
+    paths = ConfigPaths.from_cli(config_path=args.config, db_path=args.db)
+    config_path = ensure_default_config(paths.config_path)
+    db_path = ensure_db_initialized(config_path=config_path, db_path=paths.db_path)
+    limit = int(getattr(args, "limit", 50))
+    with connect(db_path) as conn:
+        rows = StateManager(conn).list_monitoring_events(limit=limit)
+    if not rows:
+        print("(no monitoring events)")
+        return 0
+    print(f"Monitoring events: {len(rows)}")
+    print(f"{'EVT_ID':>6} {'POS_ID':>6} {'SYMBOL':<10} {'DECISION':<18} {'REASON':<20} {'PNL%':<10} {'AT_UTC':<20}")
+    for r in rows:
+        print(
+            f"{int(r.get('monitoring_event_id') or 0):>6} "
+            f"{int(r.get('position_id') or 0):>6} "
+            f"{str(r.get('symbol') or '-'): <10} "
+            f"{str(r.get('decision') or '-'): <18} "
+            f"{str(r.get('exit_reason') or '-'): <20} "
+            f"{str(r.get('pnl_percent') or '-'): <10} "
+            f"{str(r.get('created_at_utc') or '-'): <20}"
+        )
+    return 0
+
+
+def _manual_client_order_id() -> str:
+    rand = secrets.token_hex(2)
+    ts = datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ")
+    return f"cg_manual_{ts}_{rand}"
+
+
+def _manual_require_human(args: argparse.Namespace) -> None:
+    if not getattr(args, "i_am_human", False):
+        raise ValueError("Missing required flag: --i-am-human")
+    if not getattr(args, "dry_run", False):
+        if not (sys.stdin.isatty() and sys.stdout.isatty()):
+            raise ValueError("Manual direct order mode requires an interactive TTY (or use --dry-run).")
+
+
+def _manual_env_label(client: BinanceSpotClient) -> str:
+    base = str(getattr(client, "base_url", "") or "").lower()
+    return "testnet" if "testnet.binance.vision" in base else "mainnet"
+
+
+def _manual_preview_common(
+    *,
+    env: str,
+    base_url: str,
+    dry_run: bool,
+    symbol: str,
+    side: str,
+    order_type: str,
+    time_in_force: str | None,
+    limit_price: str | None,
+    quantity: str | None,
+    quote_order_qty: str | None,
+    rules,
+    free_quote: Decimal | None,
+    free_base: Decimal | None,
+) -> None:
+    print("Manual Order Preview")
+    print(f"- Environment: {env}")
+    print(f"- Base URL: {base_url}")
+    print(f"- Dry run: {'yes' if dry_run else 'no'}")
+    print(f"- Symbol: {symbol}")
+    print(f"- Side: {side}")
+    print(f"- Type: {order_type}")
+    if time_in_force:
+        print(f"- Time-in-force: {time_in_force}")
+    if limit_price:
+        print(f"- Limit price: {limit_price}")
+    if quantity:
+        print(f"- Quantity: {quantity}")
+    if quote_order_qty:
+        print(f"- Quote order qty: {quote_order_qty}")
+    print(f"- Rule base_asset: {rules.base_asset}")
+    print(f"- Rule quote_asset: {rules.quote_asset}")
+    if rules.lot_size:
+        print(f"- Rule minQty: {rules.lot_size.min_qty} stepSize: {rules.lot_size.step_size}")
+    if rules.min_notional:
+        print(f"- Rule minNotional: {rules.min_notional.min_notional}")
+    if rules.price_filter:
+        print(f"- Rule tickSize: {rules.price_filter.tick_size}")
+    if free_quote is not None:
+        print(f"- Free {rules.quote_asset}: {free_quote}")
+    if free_base is not None:
+        print(f"- Free {rules.base_asset}: {free_base}")
+
+
+def _manual_get_free_balances(*, acct: dict, quote_asset: str, base_asset: str) -> tuple[Decimal, Decimal]:
+    balances = acct.get("balances", [])
+    free_quote = Decimal("0")
+    free_base = Decimal("0")
+    if isinstance(balances, list):
+        for b in balances:
+            if not isinstance(b, dict):
+                continue
+            asset = str(b.get("asset") or "").strip().upper()
+            if asset == quote_asset:
+                free_quote = _d_position(b.get("free") or "0", "account.free_quote")
+            if asset == base_asset:
+                free_base = _d_position(b.get("free") or "0", "account.free_base")
+    return free_quote, free_base
+
+
+def _manual_submit_with_idempotency(
+    *,
+    client: BinanceSpotClient,
+    state: StateManager,
+    manual_order_id: int,
+    symbol: str,
+    client_order_id: str,
+    submit_fn,
+    submit_kwargs: dict,
+) -> tuple[dict, int]:
+    # First attempt.
+    try:
+        return submit_fn(**submit_kwargs), 0
+    except BinanceAPIError as e:
+        if e.status != 0:
+            raise
+        state.update_manual_order(
+            manual_order_id=manual_order_id,
+            local_status="uncertain_submitted",
+            raw_status=None,
+            binance_order_id=None,
+            retry_count=0,
+            executed_quantity=None,
+            avg_fill_price=None,
+            total_quote_value=None,
+            fee_breakdown_json=None,
+            message=str(e),
+            details_json=_json.dumps({"reason": str(e), "stage": "submit"}, separators=(",", ":")),
+        )
+
+    # Reconcile, then retry once with same client_order_id.
+    try:
+        order = client.get_order_by_client_order_id(symbol=symbol, client_order_id=client_order_id)
+        return order, 0
+    except BinanceAPIError as e:
+        if e.code != -2013:
+            raise
+
+    order = submit_fn(**submit_kwargs)
+    state.update_manual_order(
+        manual_order_id=manual_order_id,
+        local_status="retry_submitted",
+        raw_status=None,
+        binance_order_id=None,
+        retry_count=1,
+        executed_quantity=None,
+        avg_fill_price=None,
+        total_quote_value=None,
+        fee_breakdown_json=None,
+        message="submitted_after_retry",
+        details_json=None,
+    )
+    return order, 1
+
+
+def _manual_finalize_from_order(*, state: StateManager, manual_order_id: int, order: dict, retry_count: int) -> None:
+    from cryptogent.execution.result_parser import parse_fills
+
+    raw_status = str(order.get("status") or "") or None
+    order_id = str(order.get("orderId") or "") or None
+    fills = None
+    try:
+        fills = parse_fills(order)
+    except Exception:
+        fills = None
+
+    local_status = "submitted"
+    if raw_status in ("NEW",):
+        local_status = "open"
+    elif raw_status == "FILLED":
+        local_status = "filled"
+    elif raw_status == "PARTIALLY_FILLED":
+        local_status = "partially_filled"
+    elif raw_status in ("CANCELED", "CANCELLED"):
+        local_status = "cancelled"
+    elif raw_status in ("EXPIRED",):
+        local_status = "expired"
+
+    fee_breakdown_json = None
+    executed_quantity = None
+    avg_fill_price = None
+    total_quote_value = None
+    if fills:
+        fee_breakdown_json = _json.dumps(fills.commission_breakdown, separators=(",", ":")) if fills.commission_breakdown else None
+        executed_quantity = str(fills.executed_qty)
+        avg_fill_price = str(fills.avg_fill_price) if fills.avg_fill_price is not None else None
+        total_quote_value = str(fills.total_quote_spent)
+
+    state.update_manual_order(
+        manual_order_id=manual_order_id,
+        local_status=local_status,
+        raw_status=raw_status,
+        binance_order_id=order_id,
+        retry_count=retry_count,
+        executed_quantity=executed_quantity,
+        avg_fill_price=avg_fill_price,
+        total_quote_value=total_quote_value,
+        fee_breakdown_json=fee_breakdown_json,
+        message="submitted",
+        details_json=_json.dumps({"raw_status": raw_status, "source": "exchange"}, separators=(",", ":")),
+    )
+
+
+def _manual_post_sync(*, client: BinanceSpotClient, conn, symbol: str) -> tuple[str | None, str | None]:
+    bal_status = None
+    oo_status = None
+    try:
+        bal = sync_balances(client=client, conn=conn)
+        bal_status = getattr(bal, "status", None)
+    except Exception:
+        bal_status = None
+    try:
+        oo = sync_open_orders(client=client, conn=conn, symbol=symbol)
+        oo_status = getattr(oo, "status", None)
+    except Exception:
+        oo_status = None
+    return bal_status, oo_status
+
+
+def cmd_trade_manual_list(args: argparse.Namespace) -> int:
+    paths = ConfigPaths.from_cli(config_path=args.config, db_path=args.db)
+    config_path = ensure_default_config(paths.config_path)
+    db_path = ensure_db_initialized(config_path=config_path, db_path=paths.db_path)
+    limit = int(getattr(args, "limit", 20))
+    with connect(db_path) as conn:
+        rows = StateManager(conn).list_manual_orders(limit=limit)
+    if not rows:
+        print("(no manual orders)")
+        return 0
+    print(f"Manual orders: {len(rows)}")
+    print(f"{'ID':>5} {'DRY':>3} {'ENV':<7} {'SYMBOL':<10} {'SIDE':<4} {'TYPE':<12} {'STATUS':<18} {'QTY':<12} {'QUOTE_QTY':<12} {'LMT':<12} {'ORDER_ID':<10}")
+    for r in rows:
+        print(
+            f"{int(r.get('manual_order_id') or 0):>5} "
+            f"{int(r.get('dry_run') or 0):>3} "
+            f"{str(r.get('execution_environment') or '-'): <7} "
+            f"{str(r.get('symbol') or '-'): <10} "
+            f"{str(r.get('side') or '-'): <4} "
+            f"{str(r.get('order_type') or '-'): <12} "
+            f"{str(r.get('local_status') or '-'): <18} "
+            f"{str(r.get('quantity') or '-'): <12} "
+            f"{str(r.get('quote_order_qty') or '-'): <12} "
+            f"{str(r.get('limit_price') or '-'): <12} "
+            f"{str(r.get('binance_order_id') or '-'): <10}"
+        )
+    return 0
+
+
+def cmd_trade_manual_show(args: argparse.Namespace) -> int:
+    paths = ConfigPaths.from_cli(config_path=args.config, db_path=args.db)
+    config_path = ensure_default_config(paths.config_path)
+    db_path = ensure_db_initialized(config_path=config_path, db_path=paths.db_path)
+    with connect(db_path) as conn:
+        row = StateManager(conn).get_manual_order(manual_order_id=int(args.manual_order_id))
+    if not row:
+        print("(not found)")
+        return 2
+    for k, v in row.items():
+        print(f"{k}={v}")
+    return 0
+
+
+def cmd_trade_manual_buy_market(args: argparse.Namespace) -> int:
+    _manual_require_human(args)
+    client = _client_from_args(args)
+    env = _manual_env_label(client)
+
+    symbol = str(args.symbol or "").strip().upper()
+    quote_qty = _d_position(args.quote_qty, "quote_qty")
+    dry_run = bool(getattr(args, "dry_run", False))
+
+    info = client.get_symbol_info(symbol=symbol)
+    if not info:
+        print("(symbol not found)")
+        return 2
+    rules = parse_symbol_rules(info)
+    if rules.status != "TRADING":
+        print(f"Rejected: symbol not TRADING (status={rules.status})")
+        return 2
+
+    acct = client.get_account()
+    free_quote, free_base = _manual_get_free_balances(acct=acct, quote_asset=rules.quote_asset, base_asset=rules.base_asset)
+    last_price = _d_position(client.get_ticker_price(symbol=symbol), "last_price")
+
+    # Exchange rules: ensure the quote asset matches and estimate notional.
+    pre = precheck_market_buy(rules=rules, budget_asset=rules.quote_asset, budget_amount=quote_qty, last_price=last_price)
+    if not pre.ok:
+        print(f"Rejected: {pre.error}")
+        return 2
+    if quote_qty > free_quote:
+        print("Rejected: insufficient free quote balance")
+        return 2
+
+    _manual_preview_common(
+        env=env,
+        base_url=client.base_url,
+        dry_run=dry_run,
+        symbol=symbol,
+        side="BUY",
+        order_type="MARKET",
+        time_in_force=None,
+        limit_price=None,
+        quantity=None,
+        quote_order_qty=str(quote_qty),
+        rules=rules,
+        free_quote=free_quote,
+        free_base=free_base,
+    )
+    print(f"- Live price: {last_price}")
+    if pre.estimated_qty is not None:
+        print(f"- Est. qty: {pre.estimated_qty}")
+    if pre.notional is not None:
+        print(f"- Est. notional: {pre.notional} {rules.quote_asset}")
+
+    paths = ConfigPaths.from_cli(config_path=args.config, db_path=args.db)
+    config_path = ensure_default_config(paths.config_path)
+    db_path = ensure_db_initialized(config_path=config_path, db_path=paths.db_path)
+
+    client_order_id = _manual_client_order_id()
+    with connect(db_path) as conn:
+        state = StateManager(conn)
+        details = {"live_price": str(last_price), "free_quote": str(free_quote), "free_base": str(free_base)}
+        manual_order_id = state.create_manual_order(
+            dry_run=dry_run,
+            execution_environment=env,
+            base_url=str(client.base_url),
+            symbol=symbol,
+            side="BUY",
+            order_type="MARKET_BUY",
+            time_in_force=None,
+            limit_price=None,
+            quote_order_qty=str(quote_qty),
+            quantity=None,
+            client_order_id=client_order_id,
+            message="preview",
+            details_json=_json.dumps(details, separators=(",", ":")),
+        )
+        state.append_audit(
+            level="INFO",
+            event="manual_order_preview",
+            details={"manual_order_id": manual_order_id, "symbol": symbol, "side": "BUY", "type": "MARKET_BUY", "env": env},
+        )
+
+        if dry_run:
+            state.update_manual_order(
+                manual_order_id=manual_order_id,
+                local_status="dry_run",
+                raw_status=None,
+                binance_order_id=None,
+                retry_count=0,
+                executed_quantity=None,
+                avg_fill_price=None,
+                total_quote_value=None,
+                fee_breakdown_json=None,
+                message="dry_run_only",
+                details_json=None,
+            )
+            print(f"DRY RUN: manual_order_id={manual_order_id} client_order_id={client_order_id}")
+            return 0
+
+        if not _prompt_yes_no("Submit to exchange now?", default=False):
+            state.update_manual_order(
+                manual_order_id=manual_order_id,
+                local_status="cancelled",
+                raw_status=None,
+                binance_order_id=None,
+                retry_count=0,
+                executed_quantity=None,
+                avg_fill_price=None,
+                total_quote_value=None,
+                fee_breakdown_json=None,
+                message="cancelled_by_user",
+                details_json=None,
+            )
+            print("Cancelled")
+            return 2
+
+        state.update_manual_order(
+            manual_order_id=manual_order_id,
+            local_status="submitting",
+            raw_status=None,
+            binance_order_id=None,
+            retry_count=0,
+            executed_quantity=None,
+            avg_fill_price=None,
+            total_quote_value=None,
+            fee_breakdown_json=None,
+            message="submitting",
+            details_json=None,
+        )
+
+        try:
+            order, retry_count = _manual_submit_with_idempotency(
+                client=client,
+                state=state,
+                manual_order_id=manual_order_id,
+                symbol=symbol,
+                client_order_id=client_order_id,
+                submit_fn=client.create_order_market_buy_quote,
+                submit_kwargs={"symbol": symbol, "quote_order_qty": str(quote_qty), "client_order_id": client_order_id},
+            )
+        except Exception as e:
+            state.update_manual_order(
+                manual_order_id=manual_order_id,
+                local_status="failed",
+                raw_status=None,
+                binance_order_id=None,
+                retry_count=0,
+                executed_quantity=None,
+                avg_fill_price=None,
+                total_quote_value=None,
+                fee_breakdown_json=None,
+                message=str(e),
+                details_json=None,
+            )
+            print(f"ERROR: {e}")
+            return 2
+
+        _manual_finalize_from_order(state=state, manual_order_id=manual_order_id, order=order, retry_count=retry_count)
+        state.append_audit(
+            level="INFO",
+            event="manual_order_submitted",
+            details={"manual_order_id": manual_order_id, "symbol": symbol, "side": "BUY", "type": "MARKET_BUY", "env": env},
+        )
+        bal_status, oo_status = _manual_post_sync(client=client, conn=conn, symbol=symbol)
+
+    print(f"OK manual_order_id={manual_order_id}")
+    if bal_status:
+        print(f"- Post-sync balances: {bal_status}")
+    if oo_status:
+        print(f"- Post-sync open orders: {oo_status}")
+    return 0
+
+
+def _trade_manual_reconcile_once(args: argparse.Namespace, *, quiet: bool = False) -> tuple[int, dict]:
+    client = _client_from_args(args)
+    paths = ConfigPaths.from_cli(config_path=args.config, db_path=args.db)
+    config_path = ensure_default_config(paths.config_path)
+    db_path = ensure_db_initialized(config_path=config_path, db_path=paths.db_path)
+
+    manual_order_id = getattr(args, "manual_order_id", None)
+    limit = int(getattr(args, "limit", 50))
+    updated = 0
+    errors = 0
+    status_counts: dict[str, int] = {}
+    pre_status_counts: dict[str, int] = {}
+    open_orders_seen: int | None = None
+    manual_tracked: int = 0
+    with connect(db_path) as conn:
+        state = StateManager(conn)
+        if manual_order_id not in (None, ""):
+            rows = []
+            row = state.get_manual_order(manual_order_id=int(manual_order_id))
+            if row:
+                rows = [row]
+        else:
+            rows = state.list_manual_orders_for_reconcile(limit=limit)
+
+        for r in rows:
+            ls = str(r.get("local_status") or "").strip()
+            if ls:
+                pre_status_counts[ls] = pre_status_counts.get(ls, 0) + 1
+
+        if not rows:
+            if not quiet:
+                print("(no manual orders to reconcile)")
+            # Still do a best-effort open-orders sync so the cache stays fresh.
+            try:
+                sync_open_orders(client=client, conn=conn, symbol=None)
+            except Exception:
+                pass
+            return 0, {"updated": 0, "errors": 0, "status_counts": {}, "open_orders_seen": None}
+
+        # Small fixed pause between per-order reconciliations to reduce rate-limit risk.
+        # Intentionally not user-configurable.
+        per_item_pause_s = 0.5
+        for i, r in enumerate(rows, start=1):
+            manual_tracked = i
+            mid = int(r.get("manual_order_id") or 0)
+            symbol = str(r.get("symbol") or "").strip().upper()
+            client_order_id = str(r.get("client_order_id") or "").strip()
+            if not (symbol and client_order_id):
+                continue
+            try:
+                order = client.get_order_by_client_order_id(symbol=symbol, client_order_id=client_order_id)
+            except BinanceAPIError as e:
+                errors += 1
+                state.update_manual_order(
+                    manual_order_id=mid,
+                    local_status=str(r.get("local_status") or "open"),
+                    raw_status=str(r.get("raw_status") or "") or None,
+                    binance_order_id=str(r.get("binance_order_id") or "") or None,
+                    retry_count=int(r.get("retry_count") or 0),
+                    executed_quantity=str(r.get("executed_quantity") or "") or None,
+                    avg_fill_price=str(r.get("avg_fill_price") or "") or None,
+                    total_quote_value=str(r.get("total_quote_value") or "") or None,
+                    fee_breakdown_json=str(r.get("fee_breakdown_json") or "") or None,
+                    message=f"reconcile_failed:{e}",
+                    details_json=None,
+                )
+                continue
+
+            raw_status = str(order.get("status") or "").upper()
+            local_status = "submitted"
+            if raw_status in ("NEW",):
+                local_status = "open"
+            elif raw_status == "FILLED":
+                local_status = "filled"
+            elif raw_status == "PARTIALLY_FILLED":
+                local_status = "partially_filled"
+            elif raw_status in ("CANCELED", "CANCELLED"):
+                local_status = "cancelled"
+            elif raw_status in ("EXPIRED",):
+                local_status = "expired"
+            status_counts[local_status] = status_counts.get(local_status, 0) + 1
+
+            _manual_finalize_from_order(state=state, manual_order_id=mid, order=order, retry_count=int(r.get("retry_count") or 0))
+            updated += 1
+            if i < len(rows):
+                time.sleep(per_item_pause_s)
+
+        # Best-effort post-sync: refresh cached balances + open orders.
+        try:
+            sync_balances(client=client, conn=conn)
+        except Exception:
+            pass
+        try:
+            oo = sync_open_orders(client=client, conn=conn, symbol=None)
+            try:
+                open_orders_seen = int(oo.open_orders_seen)
+            except Exception:
+                open_orders_seen = None
+        except Exception:
+            pass
+
+    stats = {
+        "updated": updated,
+        "errors": errors,
+        "status_counts": status_counts,
+        "pre_status_counts": pre_status_counts,
+        "open_orders_seen": open_orders_seen,
+        "manual_tracked": manual_tracked,
+        "manual_total": len(rows),
+    }
+    if not quiet:
+        print(f"OK reconciled updated={updated} errors={errors}")
+    return (0 if errors == 0 else 2), stats
+
+
+def cmd_trade_manual_reconcile(args: argparse.Namespace) -> int:
+    if not getattr(args, "loop", False):
+        rc, _ = _trade_manual_reconcile_once(args, quiet=False)
+        return rc
+    interval = int(getattr(args, "interval_seconds", 60))
+    duration = getattr(args, "duration_seconds", None)
+    end_at = None
+    if duration not in (None, ""):
+        end_at = time.monotonic() + int(duration)
+    print("Manual reconcile loop started. Press Ctrl-B or Ctrl-C to stop.")
+    with _cbreak_stdin():
+        try:
+            while True:
+                rc, stats = _trade_manual_reconcile_once(args, quiet=True)
+                pre = stats.get("pre_status_counts") or {}
+                open_n = int(pre.get("open", 0))
+                partial_n = int(pre.get("partially_filled", 0))
+                sc = stats.get("status_counts") or {}
+                filled_n = int(sc.get("filled", 0))
+                cancelled_n = int(sc.get("cancelled", 0))
+                expired_n = int(sc.get("expired", 0))
+                tracked_i = int(stats.get("manual_tracked", 0) or 0)
+                total_i = int(stats.get("manual_total", 0) or 0)
+                oo_seen = stats.get("open_orders_seen")
+                oo_s = f" oo={oo_seen}" if oo_seen is not None else ""
+                line = (
+                    f"manual reconcile: tracked_open={tracked_i}/{total_i} open={open_n} filled={filled_n} partial={partial_n} "
+                    f"cancelled={cancelled_n} expired={expired_n} updated={stats.get('updated', 0)} "
+                    f"errors={stats.get('errors', 0)}{oo_s}"
+                )
+                if sys.stdout.isatty():
+                    sys.stdout.write("\r\x1b[2K" + line)
+                    sys.stdout.flush()
+                else:
+                    print(line)
+                active_n = open_n + partial_n
+                if active_n == 0:
+                    if sys.stdout.isatty():
+                        print()
+                    print("Stopped (no active manual orders)")
+                    return 0
+                if end_at is not None and time.monotonic() >= end_at:
+                    if sys.stdout.isatty():
+                        print()
+                    print("Done")
+                    return rc
+                if _sleep_with_ctrl_b(seconds=float(interval), end_at=end_at, base_line=line, show_countdown=True):
+                    if sys.stdout.isatty():
+                        print()
+                    print("Stopped")
+                    return rc
+        except KeyboardInterrupt:
+            if sys.stdout.isatty():
+                print()
+            print("Stopped")
+            return 0
+
+
+def cmd_trade_reconcile_all(args: argparse.Namespace) -> int:
+    """
+    Reconcile both Phase 7 executions and manual orders.
+
+    This is a convenience wrapper; it runs:
+      1) trade reconcile (executions)
+      2) trade manual reconcile (manual_orders)
+    """
+
+    def _once(*, quiet: bool) -> tuple[int, dict, dict]:
+        rc1, s1 = _trade_reconcile_once(args, quiet=quiet)
+        rc2, s2 = _trade_manual_reconcile_once(args, quiet=quiet)
+        return (0 if (rc1 == 0 and rc2 == 0) else 2), s1, s2
+
+    if not getattr(args, "loop", False):
+        rc, _, _ = _once(quiet=False)
+        return rc
+
+    interval = int(getattr(args, "interval_seconds", 60))
+    duration = getattr(args, "duration_seconds", None)
+    end_at = None
+    if duration not in (None, ""):
+        end_at = time.monotonic() + int(duration)
+
+    print("Reconcile-all loop started. Press Ctrl-B or Ctrl-C to stop.")
+    # Small fixed pause between per-order reconciliations to reduce rate-limit risk.
+    # Intentionally not user-configurable.
+    per_order_pause_s = 0.5
+
+    with _cbreak_stdin():
+        try:
+            while True:
+                # One "tick" = reconcile everything tracked + all currently open orders, then sleep interval.
+                rc, trade_stats, manual_stats = _once(quiet=True)
+                updated_n = int(trade_stats.get("updated", 0)) + int(manual_stats.get("updated", 0))
+                errors_n = int(trade_stats.get("errors", 0)) + int(manual_stats.get("errors", 0))
+
+                paths = ConfigPaths.from_cli(config_path=args.config, db_path=args.db)
+                config_path = ensure_default_config(paths.config_path)
+                db_path = ensure_db_initialized(config_path=config_path, db_path=paths.db_path)
+                with connect(db_path) as conn:
+                    state = StateManager(conn)
+                    rows = state.list_open_orders_for_reconcile(limit=200)
+
+                open_orders = [
+                    (str(r.get("symbol") or "").strip().upper(), str(r.get("exchange_order_id") or "").strip())
+                    for r in rows
+                    if str(r.get("symbol") or "").strip() and str(r.get("exchange_order_id") or "").strip()
+                ]
+                open_total = len(open_orders)
+                if open_total == 0:
+                    if sys.stdout.isatty():
+                        sys.stdout.write("\r\x1b[2K")
+                        sys.stdout.flush()
+                        print()
+                    print("Stopped (no open orders)")
+                    return 0
+
+                # Reconcile all currently open orders one-by-one in this tick.
+                client = _client_from_args(args)
+                for i, (symbol, order_id) in enumerate(open_orders, start=1):
+                    try:
+                        order = client.get_order_by_order_id(symbol=symbol, order_id=order_id)
+                        from cryptogent.util.time import ms_to_utc_iso
+
+                        def _iso_ms(v: object) -> str:
+                            try:
+                                j = int(v)  # ms
+                            except Exception:
+                                j = 0
+                            return ms_to_utc_iso(j) if j else utcnow_iso()
+
+                        row = OrderRow(
+                            exchange_order_id=str(order.get("orderId")) if order.get("orderId") is not None else order_id,
+                            symbol=str(order.get("symbol") or symbol),
+                            side=str(order.get("side") or ""),
+                            type=str(order.get("type") or ""),
+                            status=str(order.get("status") or ""),
+                            time_in_force=str(order.get("timeInForce")) if order.get("timeInForce") is not None else None,
+                            price=str(order.get("price")) if order.get("price") is not None else None,
+                            quantity=str(order.get("origQty") or "0"),
+                            filled_quantity=str(order.get("executedQty") or "0"),
+                            executed_quantity=str(order.get("executedQty") or "0"),
+                            created_at_utc=_iso_ms(order.get("time")),
+                            updated_at_utc=_iso_ms(order.get("updateTime") or order.get("time")),
+                        )
+                        with connect(db_path) as conn:
+                            StateManager(conn).upsert_orders([row])
+                    except Exception:
+                        errors_n += 1
+
+                    line = f"reconcile-all: open={open_total} tracked_open={i} updated={updated_n} errors={errors_n}"
+                    if sys.stdout.isatty():
+                        sys.stdout.write("\r\x1b[2K" + line)
+                        sys.stdout.flush()
+                    else:
+                        print(line)
+                    # Small fixed sleep between orders (Ctrl-B stops immediately).
+                    if _sleep_with_ctrl_b(seconds=per_order_pause_s, end_at=end_at, base_line=None, show_countdown=False):
+                        if sys.stdout.isatty():
+                            print()
+                        print("Stopped")
+                        return rc
+
+                # End-of-tick status (shows tracked_open=open_total even when open_total=0).
+                end_line = f"reconcile-all: open={open_total} tracked_open={open_total} updated={updated_n} errors={errors_n}"
+                if sys.stdout.isatty():
+                    sys.stdout.write("\r\x1b[2K" + end_line)
+                    sys.stdout.flush()
+                else:
+                    print(end_line)
+
+                if end_at is not None and time.monotonic() >= end_at:
+                    if sys.stdout.isatty():
+                        print()
+                    print("Done")
+                    return rc
+
+                # Show countdown/spinner during sleep as a liveness indicator.
+                if _sleep_with_ctrl_b(seconds=float(interval), end_at=end_at, base_line=end_line, show_countdown=True):
+                    if sys.stdout.isatty():
+                        print()
+                    print("Stopped")
+                    return rc
+        except KeyboardInterrupt:
+            if sys.stdout.isatty():
+                print()
+            print("Stopped")
+            return 0
+
+
+def cmd_trade_manual_cancel(args: argparse.Namespace) -> int:
+    _manual_require_human(args)
+    client = _client_from_args(args)
+    env = _manual_env_label(client)
+
+    paths = ConfigPaths.from_cli(config_path=args.config, db_path=args.db)
+    config_path = ensure_default_config(paths.config_path)
+    db_path = ensure_db_initialized(config_path=config_path, db_path=paths.db_path)
+
+    with connect(db_path) as conn:
+        state = StateManager(conn)
+        row = state.get_manual_order(manual_order_id=int(args.manual_order_id))
+        if not row:
+            print("(not found)")
+            return 2
+        if int(row.get("dry_run") or 0) == 1:
+            print("Rejected: cannot cancel a dry-run manual order")
+            return 2
+        local_status = str(row.get("local_status") or "")
+        order_type = str(row.get("order_type") or "").strip().upper()
+        if order_type not in ("LIMIT_BUY", "LIMIT_SELL"):
+            print("Rejected: only LIMIT manual orders can be cancelled")
+            return 2
+        if local_status not in ("open", "submitted", "partially_filled", "uncertain_submitted", "retry_submitted", "submitting"):
+            print(f"Rejected: not cancellable in status={local_status}")
+            return 2
+
+        symbol = str(row.get("symbol") or "").strip().upper()
+        client_order_id = str(row.get("client_order_id") or "").strip()
+        if not (symbol and client_order_id):
+            print("Rejected: missing symbol/client_order_id")
+            return 2
+
+        print("Cancel Manual Order Preview")
+        print(f"- Manual order id: {row.get('manual_order_id')}")
+        print(f"- Environment: {env}")
+        print(f"- Base URL: {client.base_url}")
+        print(f"- Symbol: {symbol}")
+        print(f"- Type: {order_type}")
+        print(f"- Client order id: {client_order_id}")
+        if not _prompt_yes_no("Cancel on exchange now?", default=False):
+            print("Cancelled")
+            return 2
+
+        try:
+            resp = client.cancel_order_by_client_order_id(symbol=symbol, client_order_id=client_order_id)
+        except BinanceAPIError as e:
+            state.update_manual_order(
+                manual_order_id=int(args.manual_order_id),
+                local_status=local_status,
+                raw_status=str(row.get("raw_status") or "") or None,
+                binance_order_id=str(row.get("binance_order_id") or "") or None,
+                retry_count=int(row.get("retry_count") or 0),
+                executed_quantity=str(row.get("executed_quantity") or "") or None,
+                avg_fill_price=str(row.get("avg_fill_price") or "") or None,
+                total_quote_value=str(row.get("total_quote_value") or "") or None,
+                fee_breakdown_json=str(row.get("fee_breakdown_json") or "") or None,
+                message=f"cancel_failed:{e}",
+                details_json=None,
+            )
+            print(f"ERROR: {e}")
+            return 2
+
+        _manual_finalize_from_order(state=state, manual_order_id=int(args.manual_order_id), order=resp, retry_count=int(row.get("retry_count") or 0))
+        state.append_audit(
+            level="INFO",
+            event="manual_order_cancelled",
+            details={"manual_order_id": int(args.manual_order_id), "symbol": symbol, "type": order_type, "env": env},
+        )
+
+        # Post-sync (best-effort): refresh cached balances + open orders.
+        try:
+            sync_balances(client=client, conn=conn)
+        except Exception:
+            pass
+        try:
+            sync_open_orders(client=client, conn=conn, symbol=symbol)
+        except Exception:
+            pass
+
+    print("Cancelled (requested)")
+    return 0
+
+
+def cmd_trade_manual_buy_limit(args: argparse.Namespace) -> int:
+    _manual_require_human(args)
+    client = _client_from_args(args)
+    env = _manual_env_label(client)
+
+    symbol = str(args.symbol or "").strip().upper()
+    quote_qty = _d_position(args.quote_qty, "quote_qty")
+    limit_price_raw = _d_position(args.limit_price, "limit_price")
+    dry_run = bool(getattr(args, "dry_run", False))
+
+    info = client.get_symbol_info(symbol=symbol)
+    if not info:
+        print("(symbol not found)")
+        return 2
+    rules = parse_symbol_rules(info)
+    if rules.status != "TRADING":
+        print(f"Rejected: symbol not TRADING (status={rules.status})")
+        return 2
+    if not (rules.lot_size and rules.min_notional and rules.price_filter):
+        print("Rejected: missing required symbol filters (LOT_SIZE/MIN_NOTIONAL/PRICE_FILTER)")
+        return 2
+
+    acct = client.get_account()
+    free_quote, free_base = _manual_get_free_balances(acct=acct, quote_asset=rules.quote_asset, base_asset=rules.base_asset)
+
+    tick = rules.price_filter.tick_size
+    step = rules.lot_size.step_size
+    limit_price = quantize_down(limit_price_raw, tick)
+    if limit_price <= 0:
+        print("Rejected: invalid limit price after tick rounding")
+        return 2
+    est_qty_raw = quote_qty / limit_price
+    qty = quantize_down(est_qty_raw, step)
+
+    notional = qty * limit_price
+    if quote_qty > free_quote:
+        print("Rejected: insufficient free quote balance")
+        return 2
+    if qty <= 0:
+        print("Rejected: quantity rounded to zero")
+        return 2
+    if qty < rules.lot_size.min_qty:
+        print("Rejected: qty below minQty")
+        return 2
+    if notional < rules.min_notional.min_notional:
+        print("Rejected: minNotional failed")
+        return 2
+
+    _manual_preview_common(
+        env=env,
+        base_url=client.base_url,
+        dry_run=dry_run,
+        symbol=symbol,
+        side="BUY",
+        order_type="LIMIT",
+        time_in_force="GTC",
+        limit_price=str(limit_price),
+        quantity=str(qty),
+        quote_order_qty=str(quote_qty),
+        rules=rules,
+        free_quote=free_quote,
+        free_base=free_base,
+    )
+    print(f"- Est. notional: {notional} {rules.quote_asset}")
+
+    paths = ConfigPaths.from_cli(config_path=args.config, db_path=args.db)
+    config_path = ensure_default_config(paths.config_path)
+    db_path = ensure_db_initialized(config_path=config_path, db_path=paths.db_path)
+
+    client_order_id = _manual_client_order_id()
+    with connect(db_path) as conn:
+        state = StateManager(conn)
+        details = {"free_quote": str(free_quote), "free_base": str(free_base)}
+        manual_order_id = state.create_manual_order(
+            dry_run=dry_run,
+            execution_environment=env,
+            base_url=str(client.base_url),
+            symbol=symbol,
+            side="BUY",
+            order_type="LIMIT_BUY",
+            time_in_force="GTC",
+            limit_price=str(limit_price),
+            quote_order_qty=str(quote_qty),
+            quantity=str(qty),
+            client_order_id=client_order_id,
+            message="preview",
+            details_json=_json.dumps(details, separators=(",", ":")),
+        )
+        state.append_audit(
+            level="INFO",
+            event="manual_order_preview",
+            details={"manual_order_id": manual_order_id, "symbol": symbol, "side": "BUY", "type": "LIMIT_BUY", "env": env},
+        )
+
+        if dry_run:
+            state.update_manual_order(
+                manual_order_id=manual_order_id,
+                local_status="dry_run",
+                raw_status=None,
+                binance_order_id=None,
+                retry_count=0,
+                executed_quantity=None,
+                avg_fill_price=None,
+                total_quote_value=None,
+                fee_breakdown_json=None,
+                message="dry_run_only",
+                details_json=None,
+            )
+            print(f"DRY RUN: manual_order_id={manual_order_id} client_order_id={client_order_id}")
+            return 0
+
+        if not _prompt_yes_no("Submit to exchange now?", default=False):
+            state.update_manual_order(
+                manual_order_id=manual_order_id,
+                local_status="cancelled",
+                raw_status=None,
+                binance_order_id=None,
+                retry_count=0,
+                executed_quantity=None,
+                avg_fill_price=None,
+                total_quote_value=None,
+                fee_breakdown_json=None,
+                message="cancelled_by_user",
+                details_json=None,
+            )
+            print("Cancelled")
+            return 2
+
+        state.update_manual_order(
+            manual_order_id=manual_order_id,
+            local_status="submitting",
+            raw_status=None,
+            binance_order_id=None,
+            retry_count=0,
+            executed_quantity=None,
+            avg_fill_price=None,
+            total_quote_value=None,
+            fee_breakdown_json=None,
+            message="submitting",
+            details_json=None,
+        )
+
+        try:
+            order, retry_count = _manual_submit_with_idempotency(
+                client=client,
+                state=state,
+                manual_order_id=manual_order_id,
+                symbol=symbol,
+                client_order_id=client_order_id,
+                submit_fn=client.create_order_limit_buy,
+                submit_kwargs={
+                    "symbol": symbol,
+                    "price": str(limit_price),
+                    "quantity": str(qty),
+                    "client_order_id": client_order_id,
+                    "time_in_force": "GTC",
+                },
+            )
+        except Exception as e:
+            state.update_manual_order(
+                manual_order_id=manual_order_id,
+                local_status="failed",
+                raw_status=None,
+                binance_order_id=None,
+                retry_count=0,
+                executed_quantity=None,
+                avg_fill_price=None,
+                total_quote_value=None,
+                fee_breakdown_json=None,
+                message=str(e),
+                details_json=None,
+            )
+            print(f"ERROR: {e}")
+            return 2
+        _manual_finalize_from_order(state=state, manual_order_id=manual_order_id, order=order, retry_count=retry_count)
+        state.append_audit(
+            level="INFO",
+            event="manual_order_submitted",
+            details={"manual_order_id": manual_order_id, "symbol": symbol, "side": "BUY", "type": "LIMIT_BUY", "env": env},
+        )
+        bal_status, oo_status = _manual_post_sync(client=client, conn=conn, symbol=symbol)
+
+    print(f"OK manual_order_id={manual_order_id}")
+    if bal_status:
+        print(f"- Post-sync balances: {bal_status}")
+    if oo_status:
+        print(f"- Post-sync open orders: {oo_status}")
+    return 0
+
+
+def cmd_trade_manual_sell_market(args: argparse.Namespace) -> int:
+    _manual_require_human(args)
+    client = _client_from_args(args)
+    env = _manual_env_label(client)
+
+    symbol = str(args.symbol or "").strip().upper()
+    base_qty_raw = _d_position(args.base_qty, "base_qty")
+    dry_run = bool(getattr(args, "dry_run", False))
+
+    info = client.get_symbol_info(symbol=symbol)
+    if not info:
+        print("(symbol not found)")
+        return 2
+    rules = parse_symbol_rules(info)
+    if rules.status != "TRADING":
+        print(f"Rejected: symbol not TRADING (status={rules.status})")
+        return 2
+    if not (rules.lot_size and rules.min_notional):
+        print("Rejected: missing required symbol filters (LOT_SIZE/MIN_NOTIONAL)")
+        return 2
+
+    acct = client.get_account()
+    free_quote, free_base = _manual_get_free_balances(acct=acct, quote_asset=rules.quote_asset, base_asset=rules.base_asset)
+    live_price = _d_position(client.get_ticker_price(symbol=symbol), "live_price")
+
+    qty = quantize_down(base_qty_raw, rules.lot_size.step_size)
+    if qty <= 0:
+        print("Rejected: quantity rounded to zero")
+        return 2
+    if qty < rules.lot_size.min_qty:
+        print("Rejected: qty below minQty")
+        return 2
+    if qty > free_base:
+        print("Rejected: insufficient free base balance")
+        return 2
+    if (qty * live_price) < rules.min_notional.min_notional:
+        print("Rejected: minNotional failed")
+        return 2
+
+    _manual_preview_common(
+        env=env,
+        base_url=client.base_url,
+        dry_run=dry_run,
+        symbol=symbol,
+        side="SELL",
+        order_type="MARKET",
+        time_in_force=None,
+        limit_price=None,
+        quantity=str(qty),
+        quote_order_qty=None,
+        rules=rules,
+        free_quote=free_quote,
+        free_base=free_base,
+    )
+    print(f"- Live price: {live_price}")
+    print(f"- Est. proceeds: {(qty * live_price)} {rules.quote_asset}")
+
+    paths = ConfigPaths.from_cli(config_path=args.config, db_path=args.db)
+    config_path = ensure_default_config(paths.config_path)
+    db_path = ensure_db_initialized(config_path=config_path, db_path=paths.db_path)
+
+    client_order_id = _manual_client_order_id()
+    with connect(db_path) as conn:
+        state = StateManager(conn)
+        details = {"live_price": str(live_price), "free_quote": str(free_quote), "free_base": str(free_base)}
+        manual_order_id = state.create_manual_order(
+            dry_run=dry_run,
+            execution_environment=env,
+            base_url=str(client.base_url),
+            symbol=symbol,
+            side="SELL",
+            order_type="MARKET_SELL",
+            time_in_force=None,
+            limit_price=None,
+            quote_order_qty=None,
+            quantity=str(qty),
+            client_order_id=client_order_id,
+            message="preview",
+            details_json=_json.dumps(details, separators=(",", ":")),
+        )
+        state.append_audit(
+            level="INFO",
+            event="manual_order_preview",
+            details={"manual_order_id": manual_order_id, "symbol": symbol, "side": "SELL", "type": "MARKET_SELL", "env": env},
+        )
+
+        if dry_run:
+            state.update_manual_order(
+                manual_order_id=manual_order_id,
+                local_status="dry_run",
+                raw_status=None,
+                binance_order_id=None,
+                retry_count=0,
+                executed_quantity=None,
+                avg_fill_price=None,
+                total_quote_value=None,
+                fee_breakdown_json=None,
+                message="dry_run_only",
+                details_json=None,
+            )
+            print(f"DRY RUN: manual_order_id={manual_order_id} client_order_id={client_order_id}")
+            return 0
+
+        if not _prompt_yes_no("Submit to exchange now?", default=False):
+            state.update_manual_order(
+                manual_order_id=manual_order_id,
+                local_status="cancelled",
+                raw_status=None,
+                binance_order_id=None,
+                retry_count=0,
+                executed_quantity=None,
+                avg_fill_price=None,
+                total_quote_value=None,
+                fee_breakdown_json=None,
+                message="cancelled_by_user",
+                details_json=None,
+            )
+            print("Cancelled")
+            return 2
+
+        state.update_manual_order(
+            manual_order_id=manual_order_id,
+            local_status="submitting",
+            raw_status=None,
+            binance_order_id=None,
+            retry_count=0,
+            executed_quantity=None,
+            avg_fill_price=None,
+            total_quote_value=None,
+            fee_breakdown_json=None,
+            message="submitting",
+            details_json=None,
+        )
+
+        try:
+            order, retry_count = _manual_submit_with_idempotency(
+                client=client,
+                state=state,
+                manual_order_id=manual_order_id,
+                symbol=symbol,
+                client_order_id=client_order_id,
+                submit_fn=client.create_order_market_sell_qty,
+                submit_kwargs={"symbol": symbol, "quantity": str(qty), "client_order_id": client_order_id},
+            )
+        except Exception as e:
+            state.update_manual_order(
+                manual_order_id=manual_order_id,
+                local_status="failed",
+                raw_status=None,
+                binance_order_id=None,
+                retry_count=0,
+                executed_quantity=None,
+                avg_fill_price=None,
+                total_quote_value=None,
+                fee_breakdown_json=None,
+                message=str(e),
+                details_json=None,
+            )
+            print(f"ERROR: {e}")
+            return 2
+        _manual_finalize_from_order(state=state, manual_order_id=manual_order_id, order=order, retry_count=retry_count)
+        state.append_audit(
+            level="INFO",
+            event="manual_order_submitted",
+            details={"manual_order_id": manual_order_id, "symbol": symbol, "side": "SELL", "type": "MARKET_SELL", "env": env},
+        )
+        bal_status, oo_status = _manual_post_sync(client=client, conn=conn, symbol=symbol)
+
+    print(f"OK manual_order_id={manual_order_id}")
+    if bal_status:
+        print(f"- Post-sync balances: {bal_status}")
+    if oo_status:
+        print(f"- Post-sync open orders: {oo_status}")
+    return 0
+
+
+def cmd_trade_manual_sell_limit(args: argparse.Namespace) -> int:
+    _manual_require_human(args)
+    client = _client_from_args(args)
+    env = _manual_env_label(client)
+
+    symbol = str(args.symbol or "").strip().upper()
+    base_qty_raw = _d_position(args.base_qty, "base_qty")
+    limit_price_raw = _d_position(args.limit_price, "limit_price")
+    dry_run = bool(getattr(args, "dry_run", False))
+
+    info = client.get_symbol_info(symbol=symbol)
+    if not info:
+        print("(symbol not found)")
+        return 2
+    rules = parse_symbol_rules(info)
+    if rules.status != "TRADING":
+        print(f"Rejected: symbol not TRADING (status={rules.status})")
+        return 2
+    if not (rules.lot_size and rules.min_notional and rules.price_filter):
+        print("Rejected: missing required symbol filters (LOT_SIZE/MIN_NOTIONAL/PRICE_FILTER)")
+        return 2
+
+    acct = client.get_account()
+    free_quote, free_base = _manual_get_free_balances(acct=acct, quote_asset=rules.quote_asset, base_asset=rules.base_asset)
+
+    limit_price = quantize_down(limit_price_raw, rules.price_filter.tick_size)
+    qty = quantize_down(base_qty_raw, rules.lot_size.step_size)
+    notional = qty * limit_price
+
+    if qty <= 0:
+        print("Rejected: quantity rounded to zero")
+        return 2
+    if limit_price <= 0:
+        print("Rejected: invalid limit price after tick rounding")
+        return 2
+    if qty < rules.lot_size.min_qty:
+        print("Rejected: qty below minQty")
+        return 2
+    if qty > free_base:
+        print("Rejected: insufficient free base balance")
+        return 2
+    if notional < rules.min_notional.min_notional:
+        print("Rejected: minNotional failed")
+        return 2
+
+    _manual_preview_common(
+        env=env,
+        base_url=client.base_url,
+        dry_run=dry_run,
+        symbol=symbol,
+        side="SELL",
+        order_type="LIMIT",
+        time_in_force="GTC",
+        limit_price=str(limit_price),
+        quantity=str(qty),
+        quote_order_qty=None,
+        rules=rules,
+        free_quote=free_quote,
+        free_base=free_base,
+    )
+    print(f"- Est. proceeds: {notional} {rules.quote_asset}")
+
+    paths = ConfigPaths.from_cli(config_path=args.config, db_path=args.db)
+    config_path = ensure_default_config(paths.config_path)
+    db_path = ensure_db_initialized(config_path=config_path, db_path=paths.db_path)
+
+    client_order_id = _manual_client_order_id()
+    with connect(db_path) as conn:
+        state = StateManager(conn)
+        details = {"free_quote": str(free_quote), "free_base": str(free_base)}
+        manual_order_id = state.create_manual_order(
+            dry_run=dry_run,
+            execution_environment=env,
+            base_url=str(client.base_url),
+            symbol=symbol,
+            side="SELL",
+            order_type="LIMIT_SELL",
+            time_in_force="GTC",
+            limit_price=str(limit_price),
+            quote_order_qty=None,
+            quantity=str(qty),
+            client_order_id=client_order_id,
+            message="preview",
+            details_json=_json.dumps(details, separators=(",", ":")),
+        )
+        state.append_audit(
+            level="INFO",
+            event="manual_order_preview",
+            details={"manual_order_id": manual_order_id, "symbol": symbol, "side": "SELL", "type": "LIMIT_SELL", "env": env},
+        )
+
+        if dry_run:
+            state.update_manual_order(
+                manual_order_id=manual_order_id,
+                local_status="dry_run",
+                raw_status=None,
+                binance_order_id=None,
+                retry_count=0,
+                executed_quantity=None,
+                avg_fill_price=None,
+                total_quote_value=None,
+                fee_breakdown_json=None,
+                message="dry_run_only",
+                details_json=None,
+            )
+            print(f"DRY RUN: manual_order_id={manual_order_id} client_order_id={client_order_id}")
+            return 0
+
+        if not _prompt_yes_no("Submit to exchange now?", default=False):
+            state.update_manual_order(
+                manual_order_id=manual_order_id,
+                local_status="cancelled",
+                raw_status=None,
+                binance_order_id=None,
+                retry_count=0,
+                executed_quantity=None,
+                avg_fill_price=None,
+                total_quote_value=None,
+                fee_breakdown_json=None,
+                message="cancelled_by_user",
+                details_json=None,
+            )
+            print("Cancelled")
+            return 2
+
+        state.update_manual_order(
+            manual_order_id=manual_order_id,
+            local_status="submitting",
+            raw_status=None,
+            binance_order_id=None,
+            retry_count=0,
+            executed_quantity=None,
+            avg_fill_price=None,
+            total_quote_value=None,
+            fee_breakdown_json=None,
+            message="submitting",
+            details_json=None,
+        )
+
+        try:
+            order, retry_count = _manual_submit_with_idempotency(
+                client=client,
+                state=state,
+                manual_order_id=manual_order_id,
+                symbol=symbol,
+                client_order_id=client_order_id,
+                submit_fn=client.create_order_limit_sell,
+                submit_kwargs={
+                    "symbol": symbol,
+                    "price": str(limit_price),
+                    "quantity": str(qty),
+                    "client_order_id": client_order_id,
+                    "time_in_force": "GTC",
+                },
+            )
+        except Exception as e:
+            state.update_manual_order(
+                manual_order_id=manual_order_id,
+                local_status="failed",
+                raw_status=None,
+                binance_order_id=None,
+                retry_count=0,
+                executed_quantity=None,
+                avg_fill_price=None,
+                total_quote_value=None,
+                fee_breakdown_json=None,
+                message=str(e),
+                details_json=None,
+            )
+            print(f"ERROR: {e}")
+            return 2
+        _manual_finalize_from_order(state=state, manual_order_id=manual_order_id, order=order, retry_count=retry_count)
+        state.append_audit(
+            level="INFO",
+            event="manual_order_submitted",
+            details={"manual_order_id": manual_order_id, "symbol": symbol, "side": "SELL", "type": "LIMIT_SELL", "env": env},
+        )
+        bal_status, oo_status = _manual_post_sync(client=client, conn=conn, symbol=symbol)
+
+    print(f"OK manual_order_id={manual_order_id}")
+    if bal_status:
+        print(f"- Post-sync balances: {bal_status}")
+    if oo_status:
+        print(f"- Post-sync open orders: {oo_status}")
+    return 0
+
+
+def _loop_client_order_id(*, loop_id: int, leg_role: str) -> str:
+    """
+    Binance constraint: newClientOrderId must match ^[a-zA-Z0-9-_]{1,36}$.
+    Keep this short and deterministic-ish for reconciliation.
+    """
+    rand = secrets.token_hex(2)  # 4 chars
+    ts = datetime.now(UTC).strftime("%y%m%d%H%M%S")  # 12 chars
+    role = str(leg_role or "").strip().lower()
+    role_code = {
+        "buy_entry": "be",
+        "sell_tp": "st",
+        "buy_rebuy": "br",
+        "sell_sl": "sx",
+        "sell_cleanup": "sc",
+    }.get(role, "x")
+    # Example: cgl1be260318121530a7k2 (<= 36 chars)
+    cid = f"cgl{int(loop_id)}{role_code}{ts}{rand}"
+    return cid[:36]
+
+
+def _parse_offset_signed_default_negative(raw: str, *, name: str) -> Decimal:
+    """
+    Locked rule: rebuy offset may be below or above last sell.
+    - If user provides no sign, default is "dip" (negative).
+    - If user provides +/-, honor it.
+    """
+    s = str(raw or "").strip()
+    if not s:
+        raise ValueError(f"Missing {name}")
+    if s[0] not in "+-":
+        s = "-" + s
+    return _d_position(s, name)
+
+
+def _parse_offset_positive(raw: str, *, name: str) -> Decimal:
+    s = str(raw or "").strip()
+    if not s:
+        raise ValueError(f"Missing {name}")
+    d = _d_position(s, name)
+    if d <= 0:
+        raise ValueError(f"{name} must be > 0")
+    return d
+
+
+def _loop_preview(
+    *,
+    env: str,
+    base_url: str,
+    dry_run: bool,
+    symbol: str,
+    quote_qty: Decimal,
+    entry_order_type: str,
+    entry_limit_price: Decimal | None,
+    take_profit_kind: str,
+    take_profit_value: Decimal,
+    rebuy_kind: str | None,
+    rebuy_value: Decimal | None,
+    stop_loss_kind: str | None,
+    stop_loss_value: Decimal | None,
+    stop_loss_action: str,
+    cleanup_policy: str,
+    max_cycles: int,
+    rules: SymbolRules,
+    free_quote: Decimal | None,
+    free_base: Decimal | None,
+) -> None:
+    print("Manual Loop Preview")
+    print(f"- Environment: {env}")
+    print(f"- Base URL: {base_url}")
+    print(f"- Dry run: {'yes' if dry_run else 'no'}")
+    print(f"- Symbol: {symbol}")
+    print(f"- Quote qty: {quote_qty} {rules.quote_asset}")
+    print(f"- Entry: {entry_order_type}")
+    if entry_limit_price is not None:
+        print(f"- Entry limit price: {entry_limit_price}")
+    print(f"- Take-profit: {take_profit_kind}={take_profit_value}")
+    if rebuy_kind and rebuy_value is not None:
+        print(f"- Rebuy: {rebuy_kind}={rebuy_value} (signed; default dip when no sign)")
+    else:
+        print(f"- Rebuy: (none)")
+    if stop_loss_kind and stop_loss_value is not None:
+        print(f"- Stop-loss: {stop_loss_kind}={stop_loss_value} (ref=last BUY avg)")
+        print(f"- Stop-loss action: {stop_loss_action}")
+    else:
+        print(f"- Stop-loss: (none)")
+        print(f"- Stop-loss action: {stop_loss_action}")
+    print(f"- Cleanup policy: {cleanup_policy}")
+    print(f"- Max cycles: {max_cycles} (0=infinite)")
+    if rules.lot_size:
+        print(f"- Rule minQty: {rules.lot_size.min_qty} stepSize: {rules.lot_size.step_size}")
+    if rules.min_notional:
+        print(f"- Rule minNotional: {rules.min_notional.min_notional}")
+    if rules.price_filter:
+        print(f"- Rule tickSize: {rules.price_filter.tick_size}")
+    if free_quote is not None:
+        print(f"- Free {rules.quote_asset}: {free_quote}")
+    if free_base is not None:
+        print(f"- Free {rules.base_asset}: {free_base}")
+
+
+def _loop_finalize_leg_from_order(*, state: StateManager, leg_id: int, order: dict, retry_count: int) -> None:
+    raw_status = str(order.get("status") or "").strip().upper() or None
+    order_id = order.get("orderId")
+    binance_order_id = str(order_id) if order_id not in (None, "") else None
+    # Map exchange status to local status.
+    local_status = "submitted"
+    if raw_status == "NEW":
+        local_status = "open"
+    elif raw_status == "PARTIALLY_FILLED":
+        local_status = "partially_filled"
+    elif raw_status == "FILLED":
+        local_status = "filled"
+    elif raw_status in ("CANCELED", "CANCELLED"):
+        local_status = "cancelled"
+    elif raw_status == "EXPIRED":
+        local_status = "expired"
+    elif raw_status == "REJECTED":
+        local_status = "failed"
+
+    fills = None
+    try:
+        fills = parse_fills(order)
+    except Exception:
+        fills = None
+    fee_json = None
+    executed_qty = None
+    avg_price = None
+    total_quote = None
+    filled_at = None
+    if fills:
+        fee_json = _json.dumps(fills.commission_breakdown, separators=(",", ":"))
+        executed_qty = str(fills.executed_qty)
+        avg_price = str(fills.avg_fill_price) if fills.avg_fill_price is not None else None
+        total_quote = str(fills.total_quote_spent)
+        if local_status == "filled":
+            filled_at = utcnow_iso()
+
+    state.update_loop_leg(
+        leg_id=leg_id,
+        local_status=local_status,
+        raw_status=raw_status,
+        binance_order_id=binance_order_id,
+        retry_count=int(retry_count),
+        executed_quantity=executed_qty,
+        avg_fill_price=avg_price,
+        total_quote_value=total_quote,
+        fee_breakdown_json=fee_json,
+        message="reconciled",
+        reconciled_at_utc=utcnow_iso(),
+        filled_at_utc=filled_at,
+    )
+
+
+def _loop_submit_with_idempotency(
+    *,
+    client: BinanceSpotClient,
+    state: StateManager,
+    leg_id: int,
+    symbol: str,
+    client_order_id: str,
+    submit_fn,
+    submit_kwargs: dict,
+) -> tuple[dict, int]:
+    try:
+        return submit_fn(**submit_kwargs), 0
+    except BinanceAPIError as e:
+        if e.status != 0:
+            raise
+        state.update_loop_leg(
+            leg_id=leg_id,
+            local_status="uncertain_submitted",
+            raw_status=None,
+            binance_order_id=None,
+            retry_count=0,
+            executed_quantity=None,
+            avg_fill_price=None,
+            total_quote_value=None,
+            fee_breakdown_json=None,
+            message=str(e),
+        )
+        # Reconcile by client order id.
+        order = client.get_order_by_client_order_id(symbol=symbol, client_order_id=client_order_id)
+        return order, 0
+
+
+def cmd_trade_manual_loop_create(args: argparse.Namespace) -> int:
+    """
+    Stores a reusable manual loop configuration (preset). No exchange side effects.
+    """
+    symbol = str(getattr(args, "symbol", "") or "").strip().upper()
+    if not symbol:
+        print("Rejected: missing --symbol")
+        return 2
+    quote_qty = _d_position(getattr(args, "quote_qty", None), "quote_qty")
+    if quote_qty <= 0:
+        print("Rejected: --quote-qty must be > 0")
+        return 2
+
+    entry_order_type = str(getattr(args, "entry_type", "BUY_MARKET") or "BUY_MARKET").strip().upper()
+    if entry_order_type not in ("BUY_MARKET", "BUY_LIMIT"):
+        print("Rejected: invalid --entry-type")
+        return 2
+    entry_limit_price: Decimal | None = None
+    if entry_order_type == "BUY_LIMIT":
+        raw = str(getattr(args, "entry_limit_price", "") or "").strip()
+        if not raw:
+            print("Rejected: BUY_LIMIT requires --entry-limit-price")
+            return 2
+        entry_limit_price = _d_position(raw, "entry_limit_price")
+        if entry_limit_price <= 0:
+            print("Rejected: invalid entry limit price")
+            return 2
+
+    tp_abs = getattr(args, "take_profit_abs", None)
+    tp_pct = getattr(args, "take_profit_pct", None)
+    if (tp_abs in (None, "")) == (tp_pct in (None, "")):
+        print("Rejected: provide exactly one of --take-profit-abs or --take-profit-pct")
+        return 2
+    if tp_abs not in (None, ""):
+        take_profit_kind = "abs"
+        take_profit_value = _parse_offset_positive(str(tp_abs), name="take_profit_abs")
+    else:
+        take_profit_kind = "pct"
+        take_profit_value = _parse_offset_positive(str(tp_pct), name="take_profit_pct")
+
+    rebuy_abs = getattr(args, "rebuy_abs", None)
+    rebuy_pct = getattr(args, "rebuy_pct", None)
+    if rebuy_abs not in (None, "") and rebuy_pct not in (None, ""):
+        print("Rejected: provide only one of --rebuy-abs or --rebuy-pct")
+        return 2
+    rebuy_kind: str | None = None
+    rebuy_value: Decimal | None = None
+    if rebuy_abs not in (None, ""):
+        rebuy_kind = "abs"
+        rebuy_value = _parse_offset_signed_default_negative(str(rebuy_abs), name="rebuy_abs")
+    elif rebuy_pct not in (None, ""):
+        rebuy_kind = "pct"
+        rebuy_value = _parse_offset_signed_default_negative(str(rebuy_pct), name="rebuy_pct")
+
+    sl_abs = getattr(args, "stop_loss_abs", None)
+    sl_pct = getattr(args, "stop_loss_pct", None)
+    if sl_abs not in (None, "") and sl_pct not in (None, ""):
+        print("Rejected: provide only one of --stop-loss-abs or --stop-loss-pct")
+        return 2
+    stop_loss_kind: str | None = None
+    stop_loss_value: Decimal | None = None
+    if sl_abs not in (None, ""):
+        stop_loss_kind = "abs"
+        stop_loss_value = _parse_offset_positive(str(sl_abs), name="stop_loss_abs")
+    elif sl_pct not in (None, ""):
+        stop_loss_kind = "pct"
+        stop_loss_value = _parse_offset_positive(str(sl_pct), name="stop_loss_pct")
+
+    stop_loss_action = str(getattr(args, "stop_loss_action", "stop_only") or "stop_only").strip().lower()
+    if stop_loss_action not in ("stop_only", "stop_and_exit"):
+        print("Rejected: invalid --stop-loss-action (stop_only|stop_and_exit)")
+        return 2
+
+    cleanup_policy = str(getattr(args, "cleanup_policy", "cancel-open") or "cancel-open").strip().lower()
+    if cleanup_policy not in ("cancel-open", "none", "cancel-open-and-exit"):
+        print("Rejected: invalid --cleanup-policy (cancel-open|none|cancel-open-and-exit)")
+        return 2
+
+    paths = ConfigPaths.from_cli(config_path=args.config, db_path=args.db)
+    config_path = ensure_default_config(paths.config_path)
+    db_path = ensure_db_initialized(config_path=config_path, db_path=paths.db_path)
+    name = str(getattr(args, "name", "") or "").strip() or None
+    notes = str(getattr(args, "notes", "") or "").strip() or None
+
+    with connect(db_path) as conn:
+        state = StateManager(conn)
+        preset_id = state.create_loop_preset(
+            name=name,
+            notes=notes,
+            symbol=symbol,
+            quote_qty=str(quote_qty),
+            entry_order_type=entry_order_type,
+            entry_limit_price=str(entry_limit_price) if entry_limit_price is not None else None,
+            take_profit_kind=take_profit_kind,
+            take_profit_value=str(take_profit_value),
+            rebuy_kind=rebuy_kind,
+            rebuy_value=str(rebuy_value) if rebuy_value is not None else None,
+            stop_loss_kind=stop_loss_kind,
+            stop_loss_value=str(stop_loss_value) if stop_loss_value is not None else None,
+            stop_loss_action=stop_loss_action,
+            cleanup_policy=cleanup_policy,
+        )
+    print(f"OK preset_id={preset_id}")
+    return 0
+
+
+def cmd_trade_manual_loop_start(args: argparse.Namespace) -> int:
+    _manual_require_human(args)
+    client = _client_from_args(args)
+    env = _manual_env_label(client)
+    dry_run = bool(getattr(args, "dry_run", False))
+
+    # Optional: start from a stored preset id.
+    paths = ConfigPaths.from_cli(config_path=args.config, db_path=args.db)
+    config_path = ensure_default_config(paths.config_path)
+    db_path = ensure_db_initialized(config_path=config_path, db_path=paths.db_path)
+
+    preset_id = getattr(args, "id", None)
+    preset: dict | None = None
+    if preset_id not in (None, "", 0, "0"):
+        with connect(db_path) as conn:
+            preset = StateManager(conn).get_loop_preset(preset_id=int(preset_id))
+        if not preset:
+            print("(preset not found)")
+            return 2
+
+    if preset:
+        symbol = str(preset.get("symbol") or "").strip().upper()
+        quote_qty = _d_position(preset.get("quote_qty"), "quote_qty")
+    else:
+        symbol = str(getattr(args, "symbol", "") or "").strip().upper()
+        if not symbol:
+            print("Rejected: missing --symbol (or use --id)")
+            return 2
+        quote_qty = _d_position(getattr(args, "quote_qty", None), "quote_qty")
+    if quote_qty <= 0:
+        print("Rejected: --quote-qty must be > 0 (or preset quote_qty invalid)")
+        return 2
+
+    entry_order_type = str((preset.get("entry_order_type") if preset else getattr(args, "entry_type", "BUY_MARKET")) or "BUY_MARKET").strip().upper()
+    if entry_order_type not in ("BUY_MARKET", "BUY_LIMIT"):
+        print("Rejected: invalid --entry-type")
+        return 2
+    entry_limit_price: Decimal | None = None
+    if entry_order_type == "BUY_LIMIT":
+        raw = str((preset.get("entry_limit_price") if preset else getattr(args, "entry_limit_price", "")) or "").strip()
+        if not raw:
+            print("Rejected: BUY_LIMIT requires --entry-limit-price")
+            return 2
+        entry_limit_price = _d_position(raw, "entry_limit_price")
+        if entry_limit_price <= 0:
+            print("Rejected: invalid entry limit price")
+            return 2
+
+    tp_abs = (preset.get("take_profit_value") if (preset and str(preset.get("take_profit_kind") or "") == "abs") else getattr(args, "take_profit_abs", None))
+    tp_pct = (preset.get("take_profit_value") if (preset and str(preset.get("take_profit_kind") or "") == "pct") else getattr(args, "take_profit_pct", None))
+    if (tp_abs in (None, "")) == (tp_pct in (None, "")):
+        print("Rejected: provide exactly one of --take-profit-abs or --take-profit-pct")
+        return 2
+    if tp_abs not in (None, ""):
+        take_profit_kind = "abs"
+        take_profit_value = _parse_offset_positive(str(tp_abs), name="take_profit_abs")
+    else:
+        take_profit_kind = "pct"
+        take_profit_value = _parse_offset_positive(str(tp_pct), name="take_profit_pct")
+
+    rebuy_abs = (preset.get("rebuy_value") if (preset and str(preset.get("rebuy_kind") or "") == "abs") else getattr(args, "rebuy_abs", None))
+    rebuy_pct = (preset.get("rebuy_value") if (preset and str(preset.get("rebuy_kind") or "") == "pct") else getattr(args, "rebuy_pct", None))
+    if rebuy_abs not in (None, "") and rebuy_pct not in (None, ""):
+        print("Rejected: provide only one of --rebuy-abs or --rebuy-pct")
+        return 2
+    rebuy_kind: str | None = None
+    rebuy_value: Decimal | None = None
+    if rebuy_abs not in (None, ""):
+        rebuy_kind = "abs"
+        rebuy_value = _parse_offset_signed_default_negative(str(rebuy_abs), name="rebuy_abs")
+    elif rebuy_pct not in (None, ""):
+        rebuy_kind = "pct"
+        rebuy_value = _parse_offset_signed_default_negative(str(rebuy_pct), name="rebuy_pct")
+
+    sl_abs = (preset.get("stop_loss_value") if (preset and str(preset.get("stop_loss_kind") or "") == "abs") else getattr(args, "stop_loss_abs", None))
+    sl_pct = (preset.get("stop_loss_value") if (preset and str(preset.get("stop_loss_kind") or "") == "pct") else getattr(args, "stop_loss_pct", None))
+    if sl_abs not in (None, "") and sl_pct not in (None, ""):
+        print("Rejected: provide only one of --stop-loss-abs or --stop-loss-pct")
+        return 2
+    stop_loss_kind: str | None = None
+    stop_loss_value: Decimal | None = None
+    if sl_abs not in (None, ""):
+        stop_loss_kind = "abs"
+        stop_loss_value = _parse_offset_positive(str(sl_abs), name="stop_loss_abs")
+    elif sl_pct not in (None, ""):
+        stop_loss_kind = "pct"
+        stop_loss_value = _parse_offset_positive(str(sl_pct), name="stop_loss_pct")
+
+    # stop-loss action: preset default, start can override.
+    start_sla = getattr(args, "stop_loss_action", None)
+    preset_sla = (preset.get("stop_loss_action") if preset else None)
+    stop_loss_action = str(start_sla if start_sla not in (None, "") else (preset_sla if preset_sla not in (None, "") else "stop_only")).strip().lower()
+    if stop_loss_action not in ("stop_only", "stop_and_exit"):
+        print("Rejected: invalid --stop-loss-action (stop_only|stop_and_exit)")
+        return 2
+
+    start_cp = getattr(args, "cleanup_policy", None)
+    preset_cp = (preset.get("cleanup_policy") if preset else None)
+    cleanup_policy = str(start_cp if start_cp not in (None, "") else (preset_cp if preset_cp not in (None, "") else "cancel-open")).strip().lower()
+    if cleanup_policy not in ("cancel-open", "none", "cancel-open-and-exit"):
+        print("Rejected: invalid --cleanup-policy (cancel-open|none|cancel-open-and-exit)")
+        return 2
+
+    max_cycles = int(getattr(args, "max_cycles", 1))
+    if max_cycles < 0:
+        print("Rejected: --max-cycles must be >= 0")
+        return 2
+    if max_cycles == 0 or max_cycles > 1:
+        if not (rebuy_kind and rebuy_value is not None):
+            print("Rejected: rebuy offset is required when --max-cycles is 0 or > 1")
+            return 2
+
+    info = client.get_symbol_info(symbol=symbol)
+    if not info:
+        print("(symbol not found)")
+        return 2
+    rules = parse_symbol_rules(info)
+    if rules.status != "TRADING":
+        print(f"Rejected: symbol not TRADING (status={rules.status})")
+        return 2
+    if not (rules.lot_size and rules.min_notional and rules.price_filter):
+        print("Rejected: missing required symbol filters (LOT_SIZE/MIN_NOTIONAL/PRICE_FILTER)")
+        return 2
+
+    # Live account read for preview/balance check (even in dry-run; no side effects).
+    acct = client.get_account()
+    free_quote, free_base = _manual_get_free_balances(acct=acct, quote_asset=rules.quote_asset, base_asset=rules.base_asset)
+    if free_quote < quote_qty and not dry_run:
+        print(f"Rejected: insufficient free {rules.quote_asset}")
+        return 2
+
+    _loop_preview(
+        env=env,
+        base_url=str(client.base_url),
+        dry_run=dry_run,
+        symbol=symbol,
+        quote_qty=quote_qty,
+        entry_order_type=entry_order_type,
+        entry_limit_price=entry_limit_price,
+        take_profit_kind=take_profit_kind,
+        take_profit_value=take_profit_value,
+        rebuy_kind=rebuy_kind,
+        rebuy_value=rebuy_value,
+        stop_loss_kind=stop_loss_kind,
+        stop_loss_value=stop_loss_value,
+        stop_loss_action=stop_loss_action,
+        cleanup_policy=cleanup_policy,
+        max_cycles=max_cycles,
+        rules=rules,
+        free_quote=free_quote,
+        free_base=free_base,
+    )
+
+    # Ensure every session links to a preset: if starting "direct", auto-create a preset first.
+    auto_preset_id: int | None = None
+    if not preset:
+        with connect(db_path) as conn:
+            state = StateManager(conn)
+            auto_preset_id = state.create_loop_preset(
+                name=None,
+                notes="auto_created_from_start",
+                symbol=symbol,
+                quote_qty=str(quote_qty),
+                entry_order_type=entry_order_type,
+                entry_limit_price=str(entry_limit_price) if entry_limit_price is not None else None,
+                take_profit_kind=take_profit_kind,
+                take_profit_value=str(take_profit_value),
+                rebuy_kind=rebuy_kind,
+                rebuy_value=str(rebuy_value) if rebuy_value is not None else None,
+                stop_loss_kind=stop_loss_kind,
+                stop_loss_value=str(stop_loss_value) if stop_loss_value is not None else None,
+                stop_loss_action=stop_loss_action,
+                cleanup_policy=cleanup_policy,
+            )
+            state.append_audit(
+                level="INFO",
+                event="loop_preset_auto_created",
+                details={"preset_id": auto_preset_id, "symbol": symbol},
+            )
+        preset_id = auto_preset_id
+
+    with connect(db_path) as conn:
+        state = StateManager(conn)
+        loop_status = "dry_run" if dry_run else "running"
+        loop_id = state.create_loop_session(
+            dry_run=dry_run,
+            status=loop_status,
+            execution_environment=env,
+            base_url=str(client.base_url),
+            preset_id=int(preset_id) if preset_id not in (None, "", 0, "0") else None,
+            symbol=symbol,
+            quote_qty=str(quote_qty),
+            entry_order_type=entry_order_type,
+            entry_limit_price=str(entry_limit_price) if entry_limit_price is not None else None,
+            take_profit_kind=take_profit_kind,
+            take_profit_value=str(take_profit_value),
+            rebuy_kind=rebuy_kind,
+            rebuy_value=str(rebuy_value) if rebuy_value is not None else None,
+            stop_loss_kind=stop_loss_kind,
+            stop_loss_value=str(stop_loss_value) if stop_loss_value is not None else None,
+            stop_loss_action=stop_loss_action,
+            cleanup_policy=cleanup_policy,
+            max_cycles=max_cycles,
+            state="waiting_buy_fill",
+            pnl_quote_asset=rules.quote_asset,
+        )
+        state.append_loop_event(
+            loop_id=loop_id,
+            event_type="loop_created",
+            preset_id=int(preset_id) if preset_id not in (None, "", 0, "0") else None,
+            symbol=symbol,
+            message="loop_created",
+            details={
+                "quote_qty": str(quote_qty),
+                "entry": entry_order_type,
+                "take_profit": {"kind": take_profit_kind, "value": str(take_profit_value)},
+                "rebuy": {"kind": rebuy_kind, "value": str(rebuy_value) if rebuy_value is not None else None},
+                "stop_loss": {"kind": stop_loss_kind, "value": str(stop_loss_value) if stop_loss_value is not None else None},
+                "max_cycles": max_cycles,
+                "env": env,
+                "dry_run": 1 if dry_run else 0,
+                "preset_auto_created": True if auto_preset_id else False,
+            },
+        )
+
+        state.append_loop_event(
+            loop_id=loop_id,
+            event_type="loop_started",
+            preset_id=int(preset_id) if preset_id not in (None, "", 0, "0") else None,
+            symbol=symbol,
+            message="loop_started",
+            details={"loop_id": loop_id, "preset_id": int(preset_id) if preset_id not in (None, "", 0, "0") else None},
+        )
+
+        if dry_run:
+            print(f"OK loop_id={loop_id} status=dry_run")
+            return 0
+
+        if not getattr(args, "yes", False):
+            if not _prompt_yes_no("Start loop now? (submits entry BUY)", default=False):
+                state.update_loop_session(loop_id=loop_id, status="stopped", stopped_at_utc=utcnow_iso(), last_warning="cancelled_by_user")
+                state.append_loop_event(loop_id=loop_id, event_type="loop_stopped", details={"reason": "cancelled_by_user"})
+                print("Cancelled")
+                return 2
+
+        entry_qty_s: str | None = None
+        entry_limit_px: Decimal | None = entry_limit_price
+        if entry_order_type == "BUY_LIMIT":
+            entry_limit_px = quantize_down(entry_limit_price or Decimal("0"), rules.price_filter.tick_size)
+            raw_qty = quote_qty / entry_limit_px
+            qty = quantize_down(raw_qty, rules.lot_size.step_size)
+            if qty <= 0:
+                state.update_loop_session(loop_id=loop_id, status="error", last_error="entry_qty_rounded_to_zero")
+                print("Rejected: quantity rounded to zero")
+                return 2
+            if qty < rules.lot_size.min_qty:
+                state.update_loop_session(loop_id=loop_id, status="error", last_error="entry_qty_below_minQty")
+                print("Rejected: qty below minQty")
+                return 2
+            if qty * entry_limit_px < rules.min_notional.min_notional:
+                state.update_loop_session(loop_id=loop_id, status="error", last_error="entry_minNotional_failed")
+                print("Rejected: minNotional failed")
+                return 2
+            entry_qty_s = str(qty)
+
+        client_order_id = _loop_client_order_id(loop_id=loop_id, leg_role="buy_entry")
+        leg_id = state.create_loop_leg(
+            loop_id=loop_id,
+            cycle_index=1,
+            leg_role="buy_entry",
+            side="BUY",
+            order_type="MARKET_BUY" if entry_order_type == "BUY_MARKET" else "LIMIT_BUY",
+            time_in_force="GTC" if entry_order_type == "BUY_LIMIT" else None,
+            limit_price=str(entry_limit_px) if entry_limit_px is not None else None,
+            quote_order_qty=str(quote_qty),
+            quantity=entry_qty_s,
+            client_order_id=client_order_id,
+            message="created",
+        )
+        state.update_loop_session(loop_id=loop_id, last_buy_leg_id=leg_id)
+        state.update_loop_leg(
+            leg_id=leg_id,
+            local_status="submitting",
+            raw_status=None,
+            binance_order_id=None,
+            retry_count=0,
+            executed_quantity=None,
+            avg_fill_price=None,
+            total_quote_value=None,
+            fee_breakdown_json=None,
+            message="submitting",
+            submitted_at_utc=utcnow_iso(),
+        )
+
+        # Submit entry order.
+        try:
+            if entry_order_type == "BUY_MARKET":
+                order, retry_count = _loop_submit_with_idempotency(
+                    client=client,
+                    state=state,
+                    leg_id=leg_id,
+                    symbol=symbol,
+                    client_order_id=client_order_id,
+                    submit_fn=client.create_order_market_buy_quote,
+                    submit_kwargs={"symbol": symbol, "quote_order_qty": str(quote_qty), "client_order_id": client_order_id},
+                )
+            else:
+                if entry_limit_px is None or entry_qty_s is None:
+                    raise ValueError("missing entry limit sizing")
+                order, retry_count = _loop_submit_with_idempotency(
+                    client=client,
+                    state=state,
+                    leg_id=leg_id,
+                    symbol=symbol,
+                    client_order_id=client_order_id,
+                    submit_fn=client.create_order_limit_buy,
+                    submit_kwargs={
+                        "symbol": symbol,
+                        "price": str(entry_limit_px),
+                        "quantity": str(entry_qty_s),
+                        "client_order_id": client_order_id,
+                        "time_in_force": "GTC",
+                    },
+                )
+        except Exception as e:
+            state.update_loop_leg(
+                leg_id=leg_id,
+                local_status="failed",
+                raw_status=None,
+                binance_order_id=None,
+                retry_count=0,
+                executed_quantity=None,
+                avg_fill_price=None,
+                total_quote_value=None,
+                fee_breakdown_json=None,
+                message=str(e),
+            )
+            state.update_loop_session(loop_id=loop_id, status="error", last_error=str(e))
+            state.append_loop_event(loop_id=loop_id, event_type="entry_submit_failed", details={"error": str(e)})
+            print(f"ERROR: {e}")
+            return 2
+
+        _loop_finalize_leg_from_order(state=state, leg_id=leg_id, order=order, retry_count=retry_count)
+        state.append_loop_event(
+            loop_id=loop_id,
+            event_type="entry_order_submitted",
+            preset_id=int(preset_id) if preset_id not in (None, "", 0, "0") else None,
+            symbol=symbol,
+            side="BUY",
+            cycle_number=1,
+            client_order_id=client_order_id,
+            binance_order_id=str(order.get("orderId") or "") or None,
+            price=str(entry_limit_px) if entry_limit_px is not None else None,
+            quantity=entry_qty_s if entry_qty_s is not None else str(quote_qty),
+            message="submitted",
+            details={"leg_id": leg_id, "order_type": "MARKET_BUY" if entry_order_type == "BUY_MARKET" else "LIMIT_BUY"},
+        )
+
+        # Best-effort post sync (balances + open orders).
+        try:
+            sync_balances(client=client, conn=conn)
+        except Exception:
+            pass
+        try:
+            sync_open_orders(client=client, conn=conn, symbol=symbol)
+        except Exception:
+            pass
+
+    print(f"OK loop_id={loop_id} status=running")
+
+    # Normal UX: run the loop runner immediately so users don't need to call reconcile manually.
+    if bool(getattr(args, "no_run", False)):
+        return 0
+    # Hand off to the reconcile runner (advanced command) in loop mode.
+    runner_args = argparse.Namespace(
+        config=args.config,
+        db=args.db,
+        ca_bundle=getattr(args, "ca_bundle", None),
+        insecure=getattr(args, "insecure", False),
+        testnet=getattr(args, "testnet", False),
+        base_url=getattr(args, "base_url", None),
+        i_am_human=True,
+        loop_id=loop_id,
+        loop=True,
+        interval_seconds=int(getattr(args, "interval_seconds", 6)),
+        duration_seconds=getattr(args, "duration_seconds", None),
+    )
+    return cmd_trade_manual_loop_reconcile(runner_args)
+
+
+def cmd_trade_manual_loop_list(args: argparse.Namespace) -> int:
+    paths = ConfigPaths.from_cli(config_path=args.config, db_path=args.db)
+    config_path = ensure_default_config(paths.config_path)
+    db_path = ensure_db_initialized(config_path=config_path, db_path=paths.db_path)
+    limit = int(getattr(args, "limit", 20))
+    with connect(db_path) as conn:
+        rows = StateManager(conn).list_loop_sessions(limit=limit)
+    if not rows:
+        print("(no loop sessions)")
+        return 0
+    print(f"Loop sessions: {len(rows)}")
+    print(f"{'ID':>4} {'DRY':>3} {'ENV':<7} {'SYMBOL':<10} {'STATUS':<10} {'CYC':>3} {'MAX':>3} {'QUOTE_QTY':>10} {'PNL':>14} {'ASSET':<5} {'ERR':<10}")
+    for r in rows:
+        pnl = r.get("cumulative_realized_pnl_quote") or "-"
+        asset = r.get("pnl_quote_asset") or "-"
+        err = str(r.get("last_error") or "")
+        if len(err) > 10:
+            err = err[:7] + "..."
+        print(
+            f"{int(r.get('loop_id') or 0):>4} {int(r.get('dry_run') or 0):>3} {str(r.get('execution_environment') or '-'): <7} "
+            f"{str(r.get('symbol') or '-'): <10} {str(r.get('status') or '-'): <10} "
+            f"{int(r.get('cycles_completed') or 0):>3} {int(r.get('max_cycles') or 0):>3} "
+            f"{str(r.get('quote_qty') or '-'):>10} {str(pnl):>14} {str(asset): <5} {err: <10}"
+        )
+    return 0
+
+
+def _resolve_loop_id(*, state: StateManager, loop_id: int | None) -> int | None:
+    if loop_id not in (None, 0, "0"):
+        return int(loop_id)
+    row = state.get_latest_loop_session(status="running")
+    if row:
+        return int(row["loop_id"])
+    row = state.get_latest_loop_session()
+    if row:
+        return int(row["loop_id"])
+    return None
+
+
+def cmd_trade_manual_loop_status(args: argparse.Namespace) -> int:
+    paths = ConfigPaths.from_cli(config_path=args.config, db_path=args.db)
+    config_path = ensure_default_config(paths.config_path)
+    db_path = ensure_db_initialized(config_path=config_path, db_path=paths.db_path)
+    with connect(db_path) as conn:
+        state = StateManager(conn)
+        loop_id = _resolve_loop_id(state=state, loop_id=getattr(args, "loop_id", None))
+        if not loop_id:
+            print("(no loop sessions)")
+            return 2
+        loop = state.get_loop_session(loop_id=loop_id)
+        if not loop:
+            print("(loop not found)")
+            return 2
+        last_leg = state.get_latest_loop_leg(loop_id=loop_id)
+    print("Loop Status")
+    print(f"- Loop ID: {loop_id}")
+    print(f"- Status: {loop.get('status')}")
+    print(f"- State: {loop.get('state')}")
+    print(f"- Symbol: {loop.get('symbol')}")
+    print(f"- Env: {loop.get('execution_environment')}")
+    print(f"- Quote qty: {loop.get('quote_qty')}")
+    print(f"- Cycles: {loop.get('cycles_completed')}/{loop.get('max_cycles')}")
+    if loop.get("last_buy_avg_price"):
+        print(f"- Last BUY avg: {loop.get('last_buy_avg_price')}")
+    if loop.get("last_sell_avg_price"):
+        print(f"- Last SELL avg: {loop.get('last_sell_avg_price')}")
+    if loop.get("cumulative_realized_pnl_quote"):
+        print(f"- Cum realized PnL: {loop.get('cumulative_realized_pnl_quote')} {loop.get('pnl_quote_asset')}")
+    if loop.get("last_warning"):
+        print(f"- Warning: {loop.get('last_warning')}")
+    if loop.get("last_error"):
+        print(f"- Error: {loop.get('last_error')}")
+    if last_leg:
+        print(f"- Active leg: leg_id={last_leg.get('leg_id')} role={last_leg.get('leg_role')} type={last_leg.get('order_type')} status={last_leg.get('local_status')}")
+        if last_leg.get("binance_order_id"):
+            print(f"- Binance order id: {last_leg.get('binance_order_id')}")
+        if last_leg.get("client_order_id"):
+            print(f"- Client order id: {last_leg.get('client_order_id')}")
+        if last_leg.get("limit_price"):
+            print(f"- Limit price: {last_leg.get('limit_price')}")
+        if last_leg.get("quantity"):
+            print(f"- Quantity: {last_leg.get('quantity')}")
+        if last_leg.get("quote_order_qty"):
+            print(f"- Quote qty: {last_leg.get('quote_order_qty')}")
+    return 0
+
+
+def _loop_apply_cleanup_policy(
+    *,
+    client: BinanceSpotClient,
+    state: StateManager,
+    loop: dict,
+    rules: SymbolRules,
+    reason: str,
+    exit_already_done: bool = False,
+    allow_exit: bool = True,
+) -> None:
+    """
+    Order Cleanup Policy (configurable, default cancel-open):
+      - cancel-open: cancel open loop-created orders
+      - none: do nothing
+      - cancel-open-and-exit: cancel open loop orders, then MARKET SELL remaining base balance
+    """
+    loop_id = int(loop.get("loop_id") or loop.get("id") or 0)
+    if loop_id <= 0:
+        return
+    policy = str(loop.get("cleanup_policy") or "cancel-open").strip().lower()
+    if policy not in ("cancel-open", "none", "cancel-open-and-exit"):
+        policy = "cancel-open"
+
+    preset_ref = None
+    try:
+        pid = loop.get("preset_id")
+        if pid not in (None, "", 0, "0"):
+            preset_ref = int(pid)
+    except Exception:
+        preset_ref = None
+
+    symbol = str(loop.get("symbol") or "").strip().upper()
+
+    def _ev(event_type: str, **kw) -> None:
+        try:
+            state.append_loop_event(loop_id=loop_id, event_type=event_type, preset_id=preset_ref, symbol=symbol, details=kw)
+        except Exception:
+            return
+
+    if policy == "none":
+        _ev("cleanup_policy_none", reason=reason)
+        return
+
+    # Cancel all open loop legs that are cancelable (LIMIT types).
+    open_legs = state.list_loop_legs_open(loop_id=loop_id, limit=500)
+    cancelled = 0
+    for leg in open_legs:
+        ot = str(leg.get("order_type") or "")
+        coid = str(leg.get("client_order_id") or "").strip()
+        if not coid:
+            continue
+        if "LIMIT" not in ot:
+            continue
+        try:
+            client.cancel_order_by_client_order_id(symbol=symbol, client_order_id=coid)
+            state.update_loop_leg(
+                leg_id=int(leg.get("leg_id") or 0),
+                local_status="cancelled",
+                raw_status="CANCELED",
+                binance_order_id=str(leg.get("binance_order_id") or "") or None,
+                retry_count=int(leg.get("retry_count") or 0),
+                executed_quantity=leg.get("executed_quantity"),
+                avg_fill_price=leg.get("avg_fill_price"),
+                total_quote_value=leg.get("total_quote_value"),
+                fee_breakdown_json=leg.get("fee_breakdown_json"),
+                message=f"cleanup_cancelled:{reason}",
+            )
+            cancelled += 1
+            _ev("cleanup_cancelled_open_order", leg_id=int(leg.get("leg_id") or 0), client_order_id=coid, order_type=ot)
+        except Exception as e:
+            _ev("cleanup_cancel_failed", leg_id=int(leg.get("leg_id") or 0), client_order_id=coid, error=str(e))
+
+    _ev("cleanup_cancel_open_done", cancelled=cancelled, policy=policy, reason=reason)
+
+    if policy != "cancel-open-and-exit" or exit_already_done or (not allow_exit):
+        return
+
+    # Exit the remaining position using a MARKET SELL (quote slippage accepted).
+    try:
+        acct = client.get_account()
+        _, free_base = _manual_get_free_balances(acct=acct, quote_asset=rules.quote_asset, base_asset=rules.base_asset)
+        live_price = _d_position(client.get_ticker_price(symbol=symbol), "ticker_price")
+        qty = quantize_down(free_base, rules.lot_size.step_size) if rules.lot_size else free_base
+        if not rules.lot_size or not rules.min_notional:
+            _ev("cleanup_exit_skipped", reason="missing_symbol_filters")
+            return
+        if qty <= 0 or qty < rules.lot_size.min_qty:
+            _ev("cleanup_exit_skipped", reason="qty_below_minQty", qty=str(qty), free_base=str(free_base))
+            return
+        if qty * live_price < rules.min_notional.min_notional:
+            _ev("cleanup_exit_skipped", reason="minNotional_failed", qty=str(qty), price=str(live_price))
+            return
+
+        client_order_id = _loop_client_order_id(loop_id=loop_id, leg_role="sell_cleanup")
+        leg_id = state.create_loop_leg(
+            loop_id=loop_id,
+            cycle_index=int(loop.get("cycles_completed") or 0) + 1,
+            leg_role="sell_cleanup_exit",
+            side="SELL",
+            order_type="MARKET_SELL",
+            time_in_force=None,
+            limit_price=None,
+            quote_order_qty=None,
+            quantity=str(qty),
+            client_order_id=client_order_id,
+            message="created",
+        )
+        state.update_loop_leg(
+            leg_id=leg_id,
+            local_status="submitting",
+            raw_status=None,
+            binance_order_id=None,
+            retry_count=0,
+            executed_quantity=None,
+            avg_fill_price=None,
+            total_quote_value=None,
+            fee_breakdown_json=None,
+            message="submitting_cleanup_exit",
+            submitted_at_utc=utcnow_iso(),
+        )
+        order, rc = _loop_submit_with_idempotency(
+            client=client,
+            state=state,
+            leg_id=leg_id,
+            symbol=symbol,
+            client_order_id=client_order_id,
+            submit_fn=client.create_order_market_sell_qty,
+            submit_kwargs={"symbol": symbol, "quantity": str(qty), "client_order_id": client_order_id},
+        )
+        _loop_finalize_leg_from_order(state=state, leg_id=leg_id, order=order, retry_count=rc)
+        _ev("cleanup_exit_submitted", leg_id=leg_id, qty=str(qty), price=str(live_price), policy=policy, reason=reason)
+    except Exception as e:
+        _ev("cleanup_exit_failed", error=str(e), policy=policy, reason=reason)
+
+
+def cmd_trade_manual_loop_stop(args: argparse.Namespace) -> int:
+    _manual_require_human(args)
+    client = _client_from_args(args)
+    env = _manual_env_label(client)
+
+    paths = ConfigPaths.from_cli(config_path=args.config, db_path=args.db)
+    config_path = ensure_default_config(paths.config_path)
+    db_path = ensure_db_initialized(config_path=config_path, db_path=paths.db_path)
+    with connect(db_path) as conn:
+        state = StateManager(conn)
+        loop_id = _resolve_loop_id(state=state, loop_id=getattr(args, "loop_id", None))
+        if not loop_id:
+            print("(no loop sessions)")
+            return 2
+        loop = state.get_loop_session(loop_id=loop_id)
+        if not loop:
+            print("(loop not found)")
+            return 2
+        if str(loop.get("execution_environment") or "").strip().lower() != env:
+            print(f"Rejected: environment mismatch loop={loop.get('execution_environment')} runtime={env}")
+            return 2
+        # Capture current state so we can print actions taken during stop/cleanup.
+        try:
+            cur = conn.execute("SELECT COALESCE(MAX(leg_id), 0) FROM loop_legs WHERE loop_id = ?", (int(loop_id),))
+            row = cur.fetchone()
+            before_max_leg_id = int((row[0] if row else 0) or 0)
+        except Exception:
+            before_max_leg_id = 0
+        try:
+            open_before = state.list_loop_legs_open(loop_id=loop_id, limit=500)
+        except Exception:
+            open_before = []
+        leg = state.get_latest_loop_leg(loop_id=loop_id)
+        if not leg:
+            state.update_loop_session(loop_id=loop_id, status="stopped", stopped_at_utc=utcnow_iso())
+            state.append_loop_event(loop_id=loop_id, event_type="loop_stopped", details={"reason": "no_legs"})
+            print("Stopped")
+            return 0
+        symbol = str(loop.get("symbol") or "").strip().upper()
+        if not _prompt_yes_no("Stop loop now and apply cleanup policy?", default=False):
+            print("Cancelled")
+            return 2
+
+        # Apply cleanup policy (cancel loop-created open orders; optionally exit).
+        info = client.get_symbol_info(symbol=symbol)
+        if info:
+            rules = parse_symbol_rules(info)
+            if rules.lot_size and rules.min_notional and rules.price_filter:
+                _loop_apply_cleanup_policy(client=client, state=state, loop=loop, rules=rules, reason="manual_stop")
+
+        state.update_loop_session(loop_id=loop_id, status="stopped", stopped_at_utc=utcnow_iso())
+        state.append_loop_event(
+            loop_id=loop_id,
+            event_type="loop_stopped",
+            preset_id=int(loop.get("preset_id")) if loop.get("preset_id") not in (None, "", 0, "0") else None,
+            symbol=symbol,
+            message="user_stop",
+            details={"reason": "user_stop"},
+        )
+        # Best-effort sync.
+        try:
+            sync_balances(client=client, conn=conn)
+        except Exception:
+            pass
+        try:
+            sync_open_orders(client=client, conn=conn, symbol=symbol)
+        except Exception:
+            pass
+        # Print actions taken during stop (derived from loop_legs).
+        cancelled = 0
+        cancel_failed = 0
+        cancelled_details: list[str] = []
+        for b in open_before:
+            try:
+                bid = int(b.get("leg_id") or 0)
+                if bid <= 0:
+                    continue
+                after = state.get_loop_leg(leg_id=bid) or {}
+                before_status = str(b.get("local_status") or "")
+                after_status = str(after.get("local_status") or before_status)
+                if before_status != after_status:
+                    if after_status == "cancelled":
+                        cancelled += 1
+                        cancelled_details.append(f"leg_id={bid} client_order_id={b.get('client_order_id')}")
+                    elif after_status == "failed":
+                        cancel_failed += 1
+            except Exception:
+                continue
+
+        # Detect cleanup exit leg if created.
+        exit_leg = None
+        try:
+            cur = conn.execute(
+                """
+                SELECT leg_id, side, order_type, local_status, client_order_id, binance_order_id, quantity, message
+                FROM loop_legs
+                WHERE loop_id = ?
+                  AND leg_id > ?
+                  AND leg_role IN ('sell_cleanup_exit')
+                ORDER BY leg_id ASC
+                LIMIT 1
+                """,
+                (int(loop_id), int(before_max_leg_id)),
+            )
+            r = cur.fetchone()
+            if r:
+                # sqlite Row supports index access; convert to dict-like fields.
+                exit_leg = {
+                    "leg_id": r[0],
+                    "side": r[1],
+                    "order_type": r[2],
+                    "local_status": r[3],
+                    "client_order_id": r[4],
+                    "binance_order_id": r[5],
+                    "quantity": r[6],
+                    "message": r[7],
+                }
+        except Exception:
+            exit_leg = None
+
+        print("Actions")
+        print(f"- cleanup: open_before={len(open_before)} cancelled={cancelled} failed={cancel_failed}")
+        for d in cancelled_details[:10]:
+            print(f"- cleanup: cancelled {d}")
+        if len(cancelled_details) > 10:
+            print(f"- cleanup: cancelled …(+{len(cancelled_details) - 10} more)")
+        if exit_leg:
+            print(
+                f"- cleanup: exit_leg leg_id={exit_leg.get('leg_id')} status={exit_leg.get('local_status')} qty={exit_leg.get('quantity')} order_id={exit_leg.get('binance_order_id')}"
+            )
+        print("- loop: stopped (user_stop)")
+    print(f"OK stopped loop_id={loop_id}")
+    return 0
+
+
+def _offset_apply_price(*, base_price: Decimal, kind: str, value: Decimal) -> Decimal:
+    if kind == "abs":
+        return base_price + value
+    if kind == "pct":
+        return base_price * (Decimal("1") + (value / Decimal("100")))
+    raise ValueError("invalid offset kind")
+
+
+def _offset_apply_price_take_profit(*, buy_price: Decimal, kind: str, value: Decimal) -> Decimal:
+    # Always above buy price.
+    if kind == "abs":
+        return buy_price + value
+    if kind == "pct":
+        return buy_price * (Decimal("1") + (value / Decimal("100")))
+    raise ValueError("invalid take-profit kind")
+
+
+def cmd_trade_manual_loop_reconcile(args: argparse.Namespace) -> int:
+    _manual_require_human(args)
+    client = _client_from_args(args)
+    env = _manual_env_label(client)
+    loop_flag = bool(getattr(args, "loop", False))
+    interval = int(getattr(args, "interval_seconds", 60))
+    duration = getattr(args, "duration_seconds", None)
+    if interval <= 0:
+        print("Invalid interval_seconds")
+        return 2
+    end_at = None
+    if duration not in (None, ""):
+        try:
+            duration_s = int(duration)
+        except Exception:
+            print("Invalid duration_seconds")
+            return 2
+        if duration_s <= 0:
+            print("Invalid duration_seconds")
+            return 2
+        end_at = time.monotonic() + duration_s
+
+    paths = ConfigPaths.from_cli(config_path=args.config, db_path=args.db)
+    config_path = ensure_default_config(paths.config_path)
+    db_path = ensure_db_initialized(config_path=config_path, db_path=paths.db_path)
+
+    def _run_once(conn) -> tuple[int, int, int, int]:
+        state = StateManager(conn)
+        loop_id = _resolve_loop_id(state=state, loop_id=getattr(args, "loop_id", None))
+        if not loop_id:
+            return (0, 0, 0, 0)
+        loop = state.get_loop_session(loop_id=loop_id)
+        if not loop:
+            return (0, 0, 0, 0)
+        if str(loop.get("execution_environment") or "").strip().lower() != env:
+            raise ValueError(f"environment mismatch loop={loop.get('execution_environment')} runtime={env}")
+        if str(loop.get("status") or "") not in ("running",):
+            return (loop_id, 0, 0, 0)
+
+        symbol = str(loop.get("symbol") or "").strip().upper()
+        preset_ref = None
+        try:
+            pid = loop.get("preset_id")
+            if pid not in (None, "", 0, "0"):
+                preset_ref = int(pid)
+        except Exception:
+            preset_ref = None
+
+        def _ev(
+            event_type: str,
+            *,
+            side: str | None = None,
+            cycle_number: int | None = None,
+            client_order_id: str | None = None,
+            binance_order_id: str | None = None,
+            price: str | None = None,
+            quantity: str | None = None,
+            message: str | None = None,
+            details: dict | None = None,
+        ) -> None:
+            try:
+                state.append_loop_event(
+                    loop_id=loop_id,
+                    event_type=event_type,
+                    preset_id=preset_ref,
+                    symbol=symbol,
+                    side=side,
+                    cycle_number=cycle_number,
+                    client_order_id=client_order_id,
+                    binance_order_id=binance_order_id,
+                    price=price,
+                    quantity=quantity,
+                    message=message,
+                    details=details,
+                )
+            except Exception:
+                return
+
+        info = client.get_symbol_info(symbol=symbol)
+        if not info:
+            state.update_loop_session(loop_id=loop_id, status="error", last_error="symbol_not_found")
+            _ev("reconcile_error", message="symbol_not_found", details={"error": "symbol_not_found"})
+            return (loop_id, 0, 1, 1)
+        rules = parse_symbol_rules(info)
+        if not (rules.lot_size and rules.min_notional and rules.price_filter):
+            state.update_loop_session(loop_id=loop_id, status="error", last_error="missing_symbol_filters")
+            _ev("reconcile_error", message="missing_symbol_filters", details={"error": "missing_symbol_filters"})
+            return (loop_id, 0, 1, 1)
+
+        # Track the exact leg implied by the loop state (even if it already filled during submission).
+        track_leg_id = None
+        st = str(loop.get("state") or "").strip().lower()
+        if st == "waiting_buy_fill":
+            track_leg_id = loop.get("last_buy_leg_id")
+        elif st == "waiting_sell_fill":
+            track_leg_id = loop.get("last_sell_leg_id")
+        if track_leg_id not in (None, "", 0, "0"):
+            leg = state.get_loop_leg(leg_id=int(track_leg_id))
+        else:
+            leg = state.get_latest_loop_leg(loop_id=loop_id)
+        if not leg:
+            return (loop_id, 0, 0, 0)
+        leg_id = int(leg.get("leg_id") or 0)
+        client_order_id = str(leg.get("client_order_id") or "").strip()
+        if not client_order_id:
+            state.update_loop_session(loop_id=loop_id, status="error", last_error="missing_client_order_id")
+            return (loop_id, 0, 1, 1)
+
+        # Stop-loss check (based on last BUY avg price).
+        sl_kind = str(loop.get("stop_loss_kind") or "").strip().lower()
+        sl_val = loop.get("stop_loss_value")
+        last_buy_avg_s = str(loop.get("last_buy_avg_price") or "").strip()
+        if sl_kind in ("abs", "pct") and sl_val not in (None, "") and last_buy_avg_s:
+            try:
+                last_buy_avg = _d_position(last_buy_avg_s, "last_buy_avg_price")
+                sl_value = _d_position(str(sl_val), "stop_loss_value")
+                live_price = _d_position(client.get_ticker_price(symbol=symbol), "ticker_price")
+                if sl_kind == "abs":
+                    stop_px = last_buy_avg - sl_value
+                else:
+                    stop_px = last_buy_avg * (Decimal("1") - (sl_value / Decimal("100")))
+                if live_price <= stop_px:
+                    # Stop loop and cancel current open limit order (best-effort).
+                    try:
+                        client.cancel_order_by_client_order_id(symbol=symbol, client_order_id=client_order_id)
+                    except Exception:
+                        pass
+                    sla = str(loop.get("stop_loss_action") or "stop_only").strip().lower()
+                    # Optional exit: market sell the held asset (configurable).
+                    if sla == "stop_and_exit":
+                        # Determine sellable quantity (Binance free balance is source of truth).
+                        acct2 = client.get_account()
+                        free_q2, free_b2 = _manual_get_free_balances(
+                            acct=acct2, quote_asset=rules.quote_asset, base_asset=rules.base_asset
+                        )
+                        # Prefer the loop's last buy net qty if available; clamp to free balance.
+                        target_qty = free_b2
+                        try:
+                            if loop.get("last_buy_executed_qty") not in (None, ""):
+                                target_qty = min(target_qty, _d_position(str(loop.get("last_buy_executed_qty")), "last_buy_executed_qty"))
+                        except Exception:
+                            target_qty = free_b2
+                        sell_qty = quantize_down(target_qty, rules.lot_size.step_size)
+                        if sell_qty > 0 and sell_qty >= rules.lot_size.min_qty:
+                            # Create a SELL MARKET leg (protective exit) and submit.
+                            sell_client_id = _loop_client_order_id(loop_id=loop_id, leg_role="sell_sl")
+                            sell_leg_id = state.create_loop_leg(
+                                loop_id=loop_id,
+                                cycle_index=int(loop.get("cycles_completed") or 0) + 1,
+                                leg_role="sell_sl_exit",
+                                side="SELL",
+                                order_type="MARKET_SELL",
+                                time_in_force=None,
+                                limit_price=None,
+                                quote_order_qty=None,
+                                quantity=str(sell_qty),
+                                client_order_id=sell_client_id,
+                                message="created",
+                            )
+                            state.update_loop_leg(
+                                leg_id=sell_leg_id,
+                                local_status="submitting",
+                                raw_status=None,
+                                binance_order_id=None,
+                                retry_count=0,
+                                executed_quantity=None,
+                                avg_fill_price=None,
+                                total_quote_value=None,
+                                fee_breakdown_json=None,
+                                message="submitting_stop_loss_exit",
+                                submitted_at_utc=utcnow_iso(),
+                            )
+                            try:
+                                order_exit, rc_exit = _loop_submit_with_idempotency(
+                                    client=client,
+                                    state=state,
+                                    leg_id=sell_leg_id,
+                                    symbol=symbol,
+                                    client_order_id=sell_client_id,
+                                    submit_fn=client.create_order_market_sell_qty,
+                                    submit_kwargs={"symbol": symbol, "quantity": str(sell_qty), "client_order_id": sell_client_id},
+                                )
+                                _loop_finalize_leg_from_order(state=state, leg_id=sell_leg_id, order=order_exit, retry_count=rc_exit)
+                                _ev(
+                                    "stop_loss_exit_submitted",
+                                    side="SELL",
+                                    cycle_number=int(loop.get("cycles_completed") or 0) + 1,
+                                    client_order_id=sell_client_id,
+                                    binance_order_id=str(order_exit.get("orderId") or "") or None,
+                                    quantity=str(sell_qty),
+                                    message="submitted",
+                                    details={"leg_id": sell_leg_id, "free_base": str(free_b2), "free_quote": str(free_q2)},
+                                )
+                            except Exception as e:
+                                state.update_loop_session(loop_id=loop_id, status="error", last_error=f"stop_loss_exit_failed:{e}")
+                                _ev("stop_loss_exit_failed", message=str(e), details={"error": str(e)})
+
+                    # Apply cleanup policy for stop-loss, without overriding stop-loss action.
+                    # - stop_only: cancel-open only (no exit)
+                    # - stop_and_exit: exit already performed above (skip exit here)
+                    try:
+                        _loop_apply_cleanup_policy(
+                            client=client,
+                            state=state,
+                            loop=loop,
+                            rules=rules,
+                            reason="stop_loss",
+                            exit_already_done=(sla == "stop_and_exit"),
+                            allow_exit=(sla == "stop_and_exit"),
+                        )
+                    except Exception:
+                        pass
+
+                    state.update_loop_session(loop_id=loop_id, status="stopped", stopped_at_utc=utcnow_iso(), last_warning="stop_loss_triggered")
+                    _ev(
+                        "stop_loss_triggered",
+                        message=f"stop_loss_triggered action={sla}",
+                        details={"live_price": str(live_price), "stop_price": str(stop_px), "ref_buy_avg": str(last_buy_avg)},
+                    )
+                    return (loop_id, 0, 1, 0)
+            except Exception:
+                pass
+
+        updated = 0
+        prev_local = str(leg.get("local_status") or "")
+        # Refresh from exchange only when the leg is non-terminal.
+        if str(leg.get("local_status") or "") in ("created", "submitting", "submitted", "open", "partially_filled", "uncertain_submitted", "retry_submitted"):
+            order = client.get_order_by_client_order_id(symbol=symbol, client_order_id=client_order_id)
+            _loop_finalize_leg_from_order(state=state, leg_id=leg_id, order=order, retry_count=int(leg.get("retry_count") or 0))
+            updated = 1
+            leg = state.get_loop_leg(leg_id=leg_id) or leg
+            new_local = str(leg.get("local_status") or "")
+            if new_local != prev_local:
+                _ev(
+                    "order_status_changed",
+                    side=str(leg.get("side") or "").strip().upper() or None,
+                    cycle_number=int(leg.get("cycle_index") or 0) if str(leg.get("cycle_index") or "").strip() else None,
+                    client_order_id=client_order_id,
+                    binance_order_id=str(leg.get("binance_order_id") or "") or None,
+                    price=str(leg.get("limit_price") or "") or None,
+                    quantity=str(leg.get("quantity") or leg.get("quote_order_qty") or "") or None,
+                    message=f"{prev_local}->{new_local}",
+                    details={"leg_id": leg_id, "prev": prev_local, "new": new_local},
+                )
+                if new_local == "partially_filled":
+                    _ev("partial_fill_detected", message="partial_fill_detected", details={"leg_id": leg_id})
+                if new_local == "filled":
+                    _ev("order_filled", message="filled", details={"leg_id": leg_id})
+
+        if str(leg.get("local_status") or "") != "filled":
+            if updated:
+                _ev(
+                    "reconcile_tick",
+                    side=str(leg.get("side") or "").strip().upper() or None,
+                    cycle_number=int(leg.get("cycle_index") or 0) if str(leg.get("cycle_index") or "").strip() else None,
+                    client_order_id=client_order_id,
+                    binance_order_id=str(leg.get("binance_order_id") or "") or None,
+                    message=f"tick status={leg.get('local_status')}",
+                    details={"leg_id": leg_id, "status": str(leg.get("local_status") or "")},
+                )
+            return (loop_id, updated, 0, 0)
+
+        # Build fill-like values from persisted leg fields (no extra network required).
+        fills = None
+        try:
+            # Reuse parser for consistent semantics when we have FULL payload; otherwise reconstruct.
+            if "order" in locals():
+                fills = parse_fills(order)  # type: ignore[name-defined]
+        except Exception:
+            fills = None
+        if fills is None:
+            ex_qty = _d_position(str(leg.get("executed_quantity") or "0"), "executed_quantity")
+            total_quote = _d_position(str(leg.get("total_quote_value") or "0"), "total_quote_value")
+            avg = None
+            try:
+                avg_s = str(leg.get("avg_fill_price") or "").strip()
+                if avg_s:
+                    avg = _d_position(avg_s, "avg_fill_price")
+                elif ex_qty > 0:
+                    avg = total_quote / ex_qty
+            except Exception:
+                avg = (total_quote / ex_qty) if ex_qty > 0 else None
+            fee_breakdown = {}
+            try:
+                fb = _json.loads(str(leg.get("fee_breakdown_json") or "{}"))
+                if isinstance(fb, dict):
+                    fee_breakdown = {str(k).strip().upper(): str(v) for k, v in fb.items()}
+            except Exception:
+                fee_breakdown = {}
+
+            class _F:
+                executed_qty = ex_qty
+                total_quote_spent = total_quote
+                avg_fill_price = avg
+                commission_total = None
+                commission_asset = None
+                commission_breakdown = fee_breakdown
+
+            fills = _F()  # type: ignore[assignment]
+
+        fee_breakdown = fills.commission_breakdown or {}
+        base_fee = Decimal("0")
+        quote_fee = Decimal("0")
+        try:
+            bf = fee_breakdown.get(rules.base_asset)
+            if bf not in (None, ""):
+                base_fee = _d_position(bf, "base_fee")
+        except Exception:
+            base_fee = Decimal("0")
+        try:
+            qf = fee_breakdown.get(rules.quote_asset)
+            if qf not in (None, ""):
+                quote_fee = _d_position(qf, "quote_fee")
+        except Exception:
+            quote_fee = Decimal("0")
+
+        if str(leg.get("side") or "").upper() == "BUY":
+            # Compute fee-aware avg entry price (Average Cost).
+            net_qty = fills.executed_qty - base_fee
+            if net_qty <= 0:
+                state.update_loop_session(loop_id=loop_id, status="error", last_error="net_qty_nonpositive_after_fee")
+                return (loop_id, updated, 1, 1)
+            cost_basis_quote = fills.total_quote_spent + quote_fee
+            avg_entry = cost_basis_quote / net_qty
+            state.update_loop_session(
+                loop_id=loop_id,
+                last_buy_leg_id=leg_id,
+                last_buy_avg_price=str(avg_entry),
+                last_buy_executed_qty=str(net_qty),
+                state="waiting_sell_fill",
+            )
+            # Build and submit SELL LIMIT.
+            tp_kind = str(loop.get("take_profit_kind") or "")
+            tp_value = _d_position(str(loop.get("take_profit_value") or "0"), "take_profit_value")
+            sell_target = _offset_apply_price_take_profit(buy_price=avg_entry, kind=tp_kind, value=tp_value)
+            sell_px = quantize_down(sell_target, rules.price_filter.tick_size)
+            sell_qty = quantize_down(net_qty, rules.lot_size.step_size)
+            if sell_qty <= 0 or sell_qty < rules.lot_size.min_qty:
+                state.update_loop_session(loop_id=loop_id, status="stopped", stopped_at_utc=utcnow_iso(), last_warning="sell_qty_below_minQty")
+                _ev(
+                    "sell_not_possible",
+                    side="SELL",
+                    cycle_number=int(loop.get("cycles_completed") or 0) + 1,
+                    message="sell_qty_below_minQty",
+                    details={"net_qty": str(net_qty), "sell_qty": str(sell_qty)},
+                )
+                return (loop_id, updated, 1, 0)
+            if sell_qty * sell_px < rules.min_notional.min_notional:
+                state.update_loop_session(loop_id=loop_id, status="stopped", stopped_at_utc=utcnow_iso(), last_warning="sell_minNotional_failed")
+                _ev(
+                    "sell_not_possible",
+                    side="SELL",
+                    cycle_number=int(loop.get("cycles_completed") or 0) + 1,
+                    message="sell_minNotional_failed",
+                    details={"sell_qty": str(sell_qty), "sell_px": str(sell_px)},
+                )
+                return (loop_id, updated, 1, 0)
+            sell_client_id = _loop_client_order_id(loop_id=loop_id, leg_role="sell_tp")
+            sell_leg_id = state.create_loop_leg(
+                loop_id=loop_id,
+                cycle_index=int(loop.get("cycles_completed") or 0) + 1,
+                leg_role="sell_tp",
+                side="SELL",
+                order_type="LIMIT_SELL",
+                time_in_force="GTC",
+                limit_price=str(sell_px),
+                quote_order_qty=None,
+                quantity=str(sell_qty),
+                client_order_id=sell_client_id,
+                message="created",
+            )
+            state.update_loop_session(loop_id=loop_id, last_sell_leg_id=sell_leg_id)
+            state.update_loop_leg(
+                leg_id=sell_leg_id,
+                local_status="submitting",
+                raw_status=None,
+                binance_order_id=None,
+                retry_count=0,
+                executed_quantity=None,
+                avg_fill_price=None,
+                total_quote_value=None,
+                fee_breakdown_json=None,
+                message="submitting",
+                submitted_at_utc=utcnow_iso(),
+            )
+            order2, rc2 = _loop_submit_with_idempotency(
+                client=client,
+                state=state,
+                leg_id=sell_leg_id,
+                symbol=symbol,
+                client_order_id=sell_client_id,
+                submit_fn=client.create_order_limit_sell,
+                submit_kwargs={"symbol": symbol, "price": str(sell_px), "quantity": str(sell_qty), "client_order_id": sell_client_id, "time_in_force": "GTC"},
+            )
+            _loop_finalize_leg_from_order(state=state, leg_id=sell_leg_id, order=order2, retry_count=rc2)
+            _ev(
+                "sell_order_submitted",
+                side="SELL",
+                cycle_number=int(loop.get("cycles_completed") or 0) + 1,
+                client_order_id=sell_client_id,
+                binance_order_id=str(order2.get("orderId") or "") or None,
+                price=str(sell_px),
+                quantity=str(sell_qty),
+                message="submitted",
+                details={"leg_id": sell_leg_id, "order_type": "LIMIT_SELL"},
+            )
+            return (loop_id, updated + 1, 0, 0)
+
+        # SELL filled.
+        sell_avg = fills.avg_fill_price or (fills.total_quote_spent / fills.executed_qty if fills.executed_qty > 0 else None)
+        if sell_avg is None:
+            sell_avg = Decimal("0")
+        state.update_loop_session(loop_id=loop_id, last_sell_leg_id=leg_id, last_sell_avg_price=str(sell_avg), last_sell_executed_qty=str(fills.executed_qty))
+
+        # Realized PnL for this cycle (quote asset).
+        warnings: list[str] = []
+        proceeds_quote = fills.total_quote_spent
+        realized = None
+        try:
+            buy_avg_s = str(loop.get("last_buy_avg_price") or "").strip()
+            buy_avg = _d_position(buy_avg_s, "last_buy_avg_price")
+            quote_fee_sell = Decimal("0")
+            try:
+                qf2 = fee_breakdown.get(rules.quote_asset)
+                if qf2 not in (None, ""):
+                    quote_fee_sell = _d_position(qf2, "sell_quote_fee")
+            except Exception:
+                quote_fee_sell = Decimal("0")
+            realized = proceeds_quote - (fills.executed_qty * buy_avg) - quote_fee_sell
+            # Non-base/non-quote fee warning.
+            for a in fee_breakdown.keys():
+                a = str(a or "").strip().upper()
+                if a and a not in (rules.base_asset, rules.quote_asset):
+                    warnings.append("realized_pnl_excludes_non_quote_fee_conversion")
+                    warnings.append(f"fee_asset_non_base_non_quote:{a}")
+                    break
+        except Exception as e:
+            warnings.append(f"realized_pnl_error:{e}")
+
+        cum = Decimal("0")
+        try:
+            if loop.get("cumulative_realized_pnl_quote") not in (None, ""):
+                cum = _d_position(str(loop.get("cumulative_realized_pnl_quote")), "cumulative_realized_pnl_quote")
+        except Exception:
+            cum = Decimal("0")
+        if realized is not None:
+            cum = cum + realized
+        cycles_completed = int(loop.get("cycles_completed") or 0) + 1
+        state.update_loop_session(
+            loop_id=loop_id,
+            cycles_completed=cycles_completed,
+            cumulative_realized_pnl_quote=str(cum),
+            state="waiting_buy_fill",
+            last_warning=";".join(warnings) if warnings else None,
+        )
+        _ev(
+            "cycle_completed",
+            cycle_number=cycles_completed,
+            message="cycle_completed",
+            details={"cycle": cycles_completed, "realized_pnl": str(realized) if realized is not None else None, "warnings": warnings},
+        )
+
+        max_cycles_i = int(loop.get("max_cycles") or 0)
+        if max_cycles_i != 0 and cycles_completed >= max_cycles_i:
+            state.update_loop_session(loop_id=loop_id, status="completed", stopped_at_utc=utcnow_iso(), state="completed")
+            _ev("loop_completed", message="loop_completed", details={"cycles_completed": cycles_completed})
+            # Apply cleanup policy on completion (cancel open loop-created orders; optionally exit).
+            try:
+                loop2 = state.get_loop_session(loop_id=loop_id) or loop
+                _loop_apply_cleanup_policy(client=client, state=state, loop=loop2, rules=rules, reason="max_cycles_completed")
+            except Exception:
+                pass
+            # Best-effort sync after cleanup.
+            try:
+                sync_balances(client=client, conn=conn)
+            except Exception:
+                pass
+            try:
+                sync_open_orders(client=client, conn=conn, symbol=symbol)
+            except Exception:
+                pass
+            return (loop_id, updated, 0, 0)
+
+        # Submit next BUY LIMIT from rebuy offset (locked: rebuy from last sell fill price).
+        rk = str(loop.get("rebuy_kind") or "").strip().lower()
+        rv = loop.get("rebuy_value")
+        if rk not in ("abs", "pct") or rv in (None, ""):
+            state.update_loop_session(loop_id=loop_id, status="completed", stopped_at_utc=utcnow_iso(), state="completed", last_warning="rebuy_offset_missing")
+            return (loop_id, updated, 0, 0)
+
+        rebuy_val = _parse_offset_signed_default_negative(str(rv), name="rebuy_value")
+        if rk == "abs":
+            target_buy = sell_avg + rebuy_val
+        else:
+            target_buy = sell_avg * (Decimal("1") + (rebuy_val / Decimal("100")))
+        if target_buy <= 0:
+            state.update_loop_session(loop_id=loop_id, status="error", last_error="rebuy_target_nonpositive")
+            return (loop_id, updated, 1, 1)
+        buy_px = quantize_down(target_buy, rules.price_filter.tick_size)
+        raw_qty = _d_position(str(loop.get("quote_qty") or "0"), "quote_qty") / buy_px
+        buy_qty = quantize_down(raw_qty, rules.lot_size.step_size)
+        if buy_qty <= 0 or buy_qty < rules.lot_size.min_qty:
+            state.update_loop_session(loop_id=loop_id, status="stopped", stopped_at_utc=utcnow_iso(), last_warning="rebuy_qty_below_minQty")
+            return (loop_id, updated, 1, 0)
+        if buy_qty * buy_px < rules.min_notional.min_notional:
+            state.update_loop_session(loop_id=loop_id, status="stopped", stopped_at_utc=utcnow_iso(), last_warning="rebuy_minNotional_failed")
+            return (loop_id, updated, 1, 0)
+        buy_client_id = _loop_client_order_id(loop_id=loop_id, leg_role="buy_rebuy")
+        buy_leg_id = state.create_loop_leg(
+            loop_id=loop_id,
+            cycle_index=cycles_completed + 1,
+            leg_role="buy_rebuy",
+            side="BUY",
+            order_type="LIMIT_BUY",
+            time_in_force="GTC",
+            limit_price=str(buy_px),
+            quote_order_qty=str(loop.get("quote_qty")),
+            quantity=str(buy_qty),
+            client_order_id=buy_client_id,
+            message="created",
+        )
+        state.update_loop_session(loop_id=loop_id, last_buy_leg_id=buy_leg_id)
+        state.update_loop_leg(
+            leg_id=buy_leg_id,
+            local_status="submitting",
+            raw_status=None,
+            binance_order_id=None,
+            retry_count=0,
+            executed_quantity=None,
+            avg_fill_price=None,
+            total_quote_value=None,
+            fee_breakdown_json=None,
+            message="submitting",
+            submitted_at_utc=utcnow_iso(),
+        )
+        order3, rc3 = _loop_submit_with_idempotency(
+            client=client,
+            state=state,
+            leg_id=buy_leg_id,
+            symbol=symbol,
+            client_order_id=buy_client_id,
+            submit_fn=client.create_order_limit_buy,
+            submit_kwargs={"symbol": symbol, "price": str(buy_px), "quantity": str(buy_qty), "client_order_id": buy_client_id, "time_in_force": "GTC"},
+        )
+        _loop_finalize_leg_from_order(state=state, leg_id=buy_leg_id, order=order3, retry_count=rc3)
+        _ev(
+            "rebuy_order_submitted",
+            side="BUY",
+            cycle_number=cycles_completed + 1,
+            client_order_id=buy_client_id,
+            binance_order_id=str(order3.get("orderId") or "") or None,
+            price=str(buy_px),
+            quantity=str(buy_qty),
+            message="submitted",
+            details={"leg_id": buy_leg_id, "order_type": "LIMIT_BUY"},
+        )
+        return (loop_id, updated + 1, 0, 0)
+
+    def _line(loop_id: int, updated: int, errors: int, stopped: int) -> str:
+        base = f"loop reconcile: loop_id={loop_id} updated={updated} errors={errors}"
+        if stopped:
+            base += " stopped=1"
+        return base
+
+    if not loop_flag:
+        with connect(db_path) as conn:
+            try:
+                loop_id, updated, stopped, errors = _run_once(conn)
+            except Exception as e:
+                print(f"ERROR: {e}")
+                return 2
+        if loop_id == 0:
+            print("(no loop sessions)")
+            return 2
+        print(_line(loop_id, updated, errors, stopped))
+        return 0
+
+    print("Manual loop reconcile started. Ctrl-B stops the loop (cleanup policy). Ctrl-C stops the runner only.")
+    last_event_id = 0
+    try:
+        while True:
+            with connect(db_path) as conn:
+                try:
+                    loop_id, updated, stopped, errors = _run_once(conn)
+                except Exception as e:
+                    sys.stdout.write("\r\x1b[2K" + f"loop reconcile: ERROR {e}")
+                    sys.stdout.flush()
+                    return 2
+                # Print meaningful new actions (fills/submissions/cycle transitions/etc.) as separate lines.
+                try:
+                    state = StateManager(conn)
+                    if loop_id:
+                        evs = state.list_loop_events_since(loop_id=loop_id, after_event_id=last_event_id, limit=200)
+                    else:
+                        evs = []
+                except Exception:
+                    evs = []
+                important_types = {
+                    "entry_order_submitted",
+                    "sell_order_submitted",
+                    "rebuy_order_submitted",
+                    "order_status_changed",
+                    "partial_fill_detected",
+                    "order_filled",
+                    "cycle_completed",
+                    "loop_completed",
+                    "stop_loss_triggered",
+                    "stop_loss_exit_submitted",
+                    "stop_loss_exit_failed",
+                    "open_order_cancelled",
+                    "open_order_cancel_failed",
+                    "reconcile_error",
+                }
+                printable = [e for e in evs if str(e.get("event_type") or "") in important_types]
+                if evs:
+                    try:
+                        last_event_id = int(evs[-1].get("loop_event_id") or last_event_id)
+                    except Exception:
+                        pass
+                if printable:
+                    sys.stdout.write("\n")
+                    for e in printable:
+                        et = str(e.get("event_type") or "")
+                        side = str(e.get("side") or "")
+                        cyc = e.get("cycle_number")
+                        price = e.get("price")
+                        qty = e.get("quantity")
+                        msg = str(e.get("message") or "")
+                        parts = [f"event={et}"]
+                        if side:
+                            parts.append(f"side={side}")
+                        if cyc not in (None, "", 0, "0"):
+                            parts.append(f"cycle={cyc}")
+                        if price not in (None, ""):
+                            parts.append(f"price={price}")
+                        if qty not in (None, ""):
+                            parts.append(f"qty={qty}")
+                        if msg:
+                            parts.append(f"msg={msg}")
+                        print(" ".join(parts))
+            if loop_id == 0:
+                print("\n(no loop sessions)")
+                return 2
+            base_line = _line(loop_id, updated, errors, stopped)
+            sys.stdout.write("\r\x1b[2K" + base_line)
+            sys.stdout.flush()
+            if stopped:
+                print("\nStopped (loop not running)")
+                return 0
+            stop_req = _sleep_with_ctrl_b(seconds=float(interval), end_at=end_at, base_line=base_line, show_countdown=True)
+            if stop_req:
+                # Ctrl-B: force-stop the loop and apply cleanup policy (no extra confirmation).
+                try:
+                    with connect(db_path) as conn:
+                        state = StateManager(conn)
+                        loop = state.get_loop_session(loop_id=loop_id) if loop_id else None
+                        if loop and str(loop.get("status") or "") == "running":
+                            symbol = str(loop.get("symbol") or "").strip().upper()
+                            info = client.get_symbol_info(symbol=symbol)
+                            if info:
+                                rules = parse_symbol_rules(info)
+                                _loop_apply_cleanup_policy(client=client, state=state, loop=loop, rules=rules, reason="force_stop_ctrl_b")
+                            state.update_loop_session(loop_id=loop_id, status="stopped", stopped_at_utc=utcnow_iso(), last_warning="force_stopped")
+                            state.append_loop_event(loop_id=loop_id, event_type="loop_force_stopped", message="ctrl_b", details={"reason": "ctrl_b"})
+                            try:
+                                sync_balances(client=client, conn=conn)
+                            except Exception:
+                                pass
+                            try:
+                                sync_open_orders(client=client, conn=conn, symbol=symbol)
+                            except Exception:
+                                pass
+                except Exception:
+                    pass
+                print("\nStopped (loop force-stopped; cleanup applied)")
+                return 0
+            if end_at is not None and time.monotonic() >= end_at:
+                print("\nDone")
+                return 0
+    except KeyboardInterrupt:
+        # Ctrl-C: stop the runner only; leave the loop session unchanged.
+        print("\nStopped (runner only; loop still running)")
+        return 0
+
+
+def cmd_trade_manual_loop_preset_list(args: argparse.Namespace) -> int:
+    paths = ConfigPaths.from_cli(config_path=args.config, db_path=args.db)
+    config_path = ensure_default_config(paths.config_path)
+    db_path = ensure_db_initialized(config_path=config_path, db_path=paths.db_path)
+    limit = int(getattr(args, "limit", 50))
+    with connect(db_path) as conn:
+        rows = StateManager(conn).list_loop_presets(limit=limit)
+    if not rows:
+        print("(no loop presets)")
+        return 0
+    print(f"Loop presets: {len(rows)}")
+    print(f"{'ID':>4} {'AT_UTC':<20} {'NAME':<16} {'SYMBOL':<10} {'QUOTE_QTY':>10} {'ENTRY':<9}")
+    for r in rows:
+        name = str(r.get("name") or "")
+        if len(name) > 16:
+            name = name[:13] + "..."
+        print(
+            f"{int(r.get('preset_id') or 0):>4} "
+            f"{str(r.get('created_at_utc') or '-'): <20} "
+            f"{name: <16} "
+            f"{str(r.get('symbol') or '-'): <10} "
+            f"{str(r.get('quote_qty') or '-'):>10} "
+            f"{str(r.get('entry_order_type') or '-'): <9}"
+        )
+    return 0
+
+
+def cmd_trade_manual_loop_preset_show(args: argparse.Namespace) -> int:
+    preset_id = int(getattr(args, "preset_id", 0))
+    if preset_id <= 0:
+        print("Invalid preset id")
+        return 2
+    paths = ConfigPaths.from_cli(config_path=args.config, db_path=args.db)
+    config_path = ensure_default_config(paths.config_path)
+    db_path = ensure_db_initialized(config_path=config_path, db_path=paths.db_path)
+    with connect(db_path) as conn:
+        preset = StateManager(conn).get_loop_preset(preset_id=preset_id)
+    if not preset:
+        print("(preset not found)")
+        return 2
+    print("Loop Preset")
+    print(f"- Preset ID: {preset_id}")
+    if preset.get("name"):
+        print(f"- Name: {preset.get('name')}")
+    if preset.get("notes"):
+        print(f"- Notes: {preset.get('notes')}")
+    print(f"- Symbol: {preset.get('symbol')}")
+    print(f"- Quote qty: {preset.get('quote_qty')}")
+    print(f"- Entry type: {preset.get('entry_order_type')}")
+    if preset.get("entry_limit_price"):
+        print(f"- Entry limit price: {preset.get('entry_limit_price')}")
+    print(f"- Take-profit: {preset.get('take_profit_kind')}={preset.get('take_profit_value')}")
+    if preset.get("rebuy_kind") and preset.get("rebuy_value") not in (None, ""):
+        print(f"- Rebuy: {preset.get('rebuy_kind')}={preset.get('rebuy_value')}")
+    else:
+        print("- Rebuy: (none)")
+    if preset.get("stop_loss_kind") and preset.get("stop_loss_value") not in (None, ""):
+        print(f"- Stop-loss: {preset.get('stop_loss_kind')}={preset.get('stop_loss_value')}")
+    else:
+        print("- Stop-loss: (none)")
+    print(f"- Created: {preset.get('created_at_utc')}")
+    print(f"- Updated: {preset.get('updated_at_utc')}")
+    return 0
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -2007,9 +6434,73 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p_cfg_set_testnet.set_defaults(fn=cmd_config_set_binance_testnet)
 
+    p_cfg_sync_burn = cfg_sub.add_parser("sync-bnb-burn", help="Fetch and persist Binance spotBNBBurn flag into config.")
+    _add_common_paths(p_cfg_sync_burn)
+    p_cfg_sync_burn.set_defaults(fn=cmd_config_sync_bnb_burn)
+
+    p_cfg_set_burn = cfg_sub.add_parser("set-bnb-burn", help="Enable/disable paying Spot fees with BNB (spotBNBBurn).")
+    _add_common_paths(p_cfg_set_burn)
+    g_burn = p_cfg_set_burn.add_mutually_exclusive_group(required=True)
+    g_burn.add_argument("--enabled", dest="enabled", action="store_true", help="Enable spotBNBBurn (pay Spot fees with BNB).")
+    g_burn.add_argument("--disabled", dest="enabled", action="store_false", help="Disable spotBNBBurn.")
+    p_cfg_set_burn.set_defaults(fn=cmd_config_set_bnb_burn)
+
     p_status = sub.add_parser("status", help="Show local setup status.")
     _add_common_paths(p_status)
     p_status.set_defaults(fn=cmd_status)
+
+    p_pos = sub.add_parser("position", help="Inspect stored positions (Phase 8; no execution).")
+    _add_common_paths(p_pos)
+    pos_sub = p_pos.add_subparsers(dest="position_cmd", required=True)
+
+    p_pos_list = pos_sub.add_parser("list", help="List positions.")
+    _add_common_paths(p_pos_list)
+    p_pos_list.add_argument("--status", default=None, help="Filter by status (e.g. OPEN/CLOSED).")
+    p_pos_list.add_argument("--limit", type=int, default=50, help="Limit rows (default: 50).")
+    p_pos_list.set_defaults(fn=cmd_position_list)
+
+    p_pos_show = pos_sub.add_parser("show", help="Show one position (optionally compute unrealized PnL live).")
+    _add_common_paths(p_pos_show)
+    _add_exchange_tls_only_args(p_pos_show)
+    p_pos_show.add_argument("position_id", type=int, help="Position id.")
+    p_pos_show.add_argument("--live", action="store_true", help="Fetch current price and compute unrealized PnL.")
+    p_pos_show.set_defaults(fn=cmd_position_show)
+
+    p_mon = sub.add_parser("monitor", help="Phase 8 monitoring (decisions only; no execution).")
+    _add_common_paths(p_mon)
+    mon_sub = p_mon.add_subparsers(dest="monitor_cmd", required=True)
+
+    p_mon_once = mon_sub.add_parser("once", help="Run one monitoring tick over open positions.")
+    _add_common_paths(p_mon_once)
+    _add_exchange_tls_only_args(p_mon_once)
+    p_mon_once.add_argument("--limit", type=int, default=50, help="Limit positions checked (default: 50).")
+    p_mon_once.add_argument("--position-id", type=int, default=None, help="Monitor only this OPEN position id.")
+    p_mon_once.add_argument("--verbose", action="store_true", help="Print per-position live PnL each tick.")
+    p_mon_once.set_defaults(fn=cmd_monitor_once)
+
+    p_mon_loop = mon_sub.add_parser("loop", help="Run monitoring ticks repeatedly.")
+    _add_common_paths(p_mon_loop)
+    _add_exchange_tls_only_args(p_mon_loop)
+    p_mon_loop.add_argument("--limit", type=int, default=50, help="Limit positions checked per tick (default: 50).")
+    p_mon_loop.add_argument("--position-id", type=int, default=None, help="Monitor only this OPEN position id.")
+    p_mon_loop.add_argument(
+        "--interval-seconds",
+        type=int,
+        default=None,
+        help="Sleep between ticks (default: from config or fallback).",
+    )
+    p_mon_loop.add_argument("--duration-seconds", type=int, default=None, help="Stop after this many seconds (default: run until Ctrl-C).")
+    p_mon_loop.add_argument("--verbose", action="store_true", help="Print per-position live PnL each tick.")
+    p_mon_loop.set_defaults(fn=cmd_monitor_loop)
+
+    p_mon_events = mon_sub.add_parser("events", help="Monitoring event history.")
+    _add_common_paths(p_mon_events)
+    events_sub = p_mon_events.add_subparsers(dest="events_cmd", required=True)
+
+    p_mon_events_list = events_sub.add_parser("list", help="List monitoring events.")
+    _add_common_paths(p_mon_events_list)
+    p_mon_events_list.add_argument("--limit", type=int, default=50, help="Limit rows (default: 50).")
+    p_mon_events_list.set_defaults(fn=cmd_monitor_events_list)
 
     p_ex = sub.add_parser("exchange", help="Binance Spot connectivity utilities (no trading).")
     _add_common_paths(p_ex)
@@ -2066,7 +6557,13 @@ def build_parser() -> argparse.ArgumentParser:
     _add_common_paths(p_show_bal)
     p_show_bal.add_argument("--all", action="store_true", help="Include zero balances.")
     p_show_bal.add_argument("--limit", type=int, default=None, help="Limit rows.")
-    p_show_bal.add_argument("--filter", type=str, default=None, help="Filter by asset substring (e.g. USDT).")
+    p_show_bal.add_argument(
+        "--filter",
+        type=str,
+        default=None,
+        help='Filter balances by exact asset(s): e.g. SOL or "SOL,AI". Use --contains for substring search.',
+    )
+    p_show_bal.add_argument("--contains", action="store_true", help="Use substring match instead of exact asset match.")
     p_show_bal.set_defaults(fn=cmd_show_balances)
 
     p_show_oo = show_sub.add_parser("open-orders", help="Show cached open orders.")
@@ -2180,12 +6677,33 @@ def build_parser() -> argparse.ArgumentParser:
     p_trade_safety.add_argument(
         "--order-type",
         default="MARKET_BUY",
-        help="Order type for the generated execution candidate: MARKET_BUY|LIMIT_BUY (default: MARKET_BUY).",
+        help="Order type for the generated execution candidate: MARKET_BUY|LIMIT_BUY|MARKET_SELL|LIMIT_SELL (default: MARKET_BUY).",
     )
     p_trade_safety.add_argument(
         "--limit-price",
         default=None,
-        help="Required when --order-type=LIMIT_BUY. Limit price in quote asset (e.g. 61829.72).",
+        help="Required when --order-type=LIMIT_BUY or LIMIT_SELL. Limit price in quote asset (e.g. 61829.72).",
+    )
+    p_trade_safety.add_argument(
+        "--position-id",
+        default=None,
+        help="SELL only. Optional explicit position id to close (default: active position for this symbol).",
+    )
+    p_trade_safety.add_argument(
+        "--close-mode",
+        choices=["amount", "percent", "all"],
+        default="all",
+        help="SELL only. How much of the position to close: amount|percent|all (default: all).",
+    )
+    p_trade_safety.add_argument(
+        "--close-amount",
+        default=None,
+        help="SELL only. Required when --close-mode=amount. Base-asset quantity to sell (e.g. 1.25).",
+    )
+    p_trade_safety.add_argument(
+        "--close-percent",
+        default=None,
+        help="SELL only. Required when --close-mode=percent. Percent of position to sell (e.g. 50).",
     )
     p_trade_safety.set_defaults(fn=cmd_trade_safety)
 
@@ -2216,10 +6734,204 @@ def build_parser() -> argparse.ArgumentParser:
     p_trade_exec_cancel.add_argument("execution_id", type=int, help="Execution id.")
     p_trade_exec_cancel.set_defaults(fn=cmd_trade_execution_cancel)
 
+    p_trade_manual = trade_sub.add_parser(
+        "manual",
+        help="Manual direct order mode (human-only; bypasses planning/safety; enforces exchange rules).",
+    )
+    _add_common_paths(p_trade_manual)
+    manual_sub = p_trade_manual.add_subparsers(dest="manual_cmd", required=True)
+
+    p_manual_list = manual_sub.add_parser("list", help="List manual orders.")
+    _add_common_paths(p_manual_list)
+    p_manual_list.add_argument("--limit", type=int, default=20, help="Limit rows (default: 20).")
+    p_manual_list.set_defaults(fn=cmd_trade_manual_list)
+
+    p_manual_show = manual_sub.add_parser("show", help="Show one manual order.")
+    _add_common_paths(p_manual_show)
+    p_manual_show.add_argument("manual_order_id", type=int, help="Manual order id.")
+    p_manual_show.set_defaults(fn=cmd_trade_manual_show)
+
+    p_manual_reconcile = manual_sub.add_parser("reconcile", help="Reconcile manual orders with Binance by clientOrderId.")
+    _add_common_paths(p_manual_reconcile)
+    _add_exchange_tls_args(p_manual_reconcile)
+    p_manual_reconcile.add_argument("--manual-order-id", type=int, default=None, help="Reconcile only this manual order id.")
+    p_manual_reconcile.add_argument("--limit", type=int, default=50, help="Limit rows (default: 50).")
+    p_manual_reconcile.add_argument("--loop", action="store_true", help="Run reconciliation repeatedly until stopped.")
+    p_manual_reconcile.add_argument("--interval-seconds", type=int, default=60, help="Sleep between loops (default: 60).")
+    p_manual_reconcile.add_argument("--duration-seconds", type=int, default=None, help="Stop after this many seconds (default: run until stopped).")
+    p_manual_reconcile.set_defaults(fn=cmd_trade_manual_reconcile)
+
+    p_manual_cancel = manual_sub.add_parser("cancel", help="Cancel an open LIMIT manual order on Binance.")
+    _add_common_paths(p_manual_cancel)
+    _add_exchange_tls_args(p_manual_cancel)
+    p_manual_cancel.add_argument("--i-am-human", action="store_true", required=True, help="Required safety flag.")
+    p_manual_cancel.add_argument("manual_order_id", type=int, help="Manual order id.")
+    p_manual_cancel.set_defaults(fn=cmd_trade_manual_cancel)
+
+    p_manual_bm = manual_sub.add_parser("buy-market", help="Manual MARKET BUY using quoteOrderQty.")
+    _add_common_paths(p_manual_bm)
+    _add_exchange_tls_args(p_manual_bm)
+    p_manual_bm.add_argument("--i-am-human", action="store_true", required=True, help="Required safety flag.")
+    p_manual_bm.add_argument("--dry-run", action="store_true", help="Preview + live checks only; do not submit.")
+    p_manual_bm.add_argument("--symbol", required=True, help="Symbol (e.g. BTCUSDT).")
+    p_manual_bm.add_argument("--quote-qty", required=True, help="Quote amount to spend (e.g. 50).")
+    p_manual_bm.set_defaults(fn=cmd_trade_manual_buy_market)
+
+    p_manual_bl = manual_sub.add_parser("buy-limit", help="Manual LIMIT BUY (GTC) sized from quote budget.")
+    _add_common_paths(p_manual_bl)
+    _add_exchange_tls_args(p_manual_bl)
+    p_manual_bl.add_argument("--i-am-human", action="store_true", required=True, help="Required safety flag.")
+    p_manual_bl.add_argument("--dry-run", action="store_true", help="Preview + live checks only; do not submit.")
+    p_manual_bl.add_argument("--symbol", required=True, help="Symbol (e.g. BTCUSDT).")
+    p_manual_bl.add_argument("--quote-qty", required=True, help="Quote budget to allocate (e.g. 50).")
+    p_manual_bl.add_argument("--limit-price", required=True, help="Limit price (e.g. 61829.72).")
+    p_manual_bl.set_defaults(fn=cmd_trade_manual_buy_limit)
+
+    p_manual_sm = manual_sub.add_parser("sell-market", help="Manual MARKET SELL by base quantity.")
+    _add_common_paths(p_manual_sm)
+    _add_exchange_tls_args(p_manual_sm)
+    p_manual_sm.add_argument("--i-am-human", action="store_true", required=True, help="Required safety flag.")
+    p_manual_sm.add_argument("--dry-run", action="store_true", help="Preview + live checks only; do not submit.")
+    p_manual_sm.add_argument("--symbol", required=True, help="Symbol (e.g. SOLUSDT).")
+    p_manual_sm.add_argument("--base-qty", required=True, help="Base quantity to sell (e.g. 1.0).")
+    p_manual_sm.set_defaults(fn=cmd_trade_manual_sell_market)
+
+    p_manual_sl = manual_sub.add_parser("sell-limit", help="Manual LIMIT SELL (GTC) by base quantity.")
+    _add_common_paths(p_manual_sl)
+    _add_exchange_tls_args(p_manual_sl)
+    p_manual_sl.add_argument("--i-am-human", action="store_true", required=True, help="Required safety flag.")
+    p_manual_sl.add_argument("--dry-run", action="store_true", help="Preview + live checks only; do not submit.")
+    p_manual_sl.add_argument("--symbol", required=True, help="Symbol (e.g. SOLUSDT).")
+    p_manual_sl.add_argument("--base-qty", required=True, help="Base quantity to sell (e.g. 1.0).")
+    p_manual_sl.add_argument("--limit-price", required=True, help="Limit price (e.g. 100.00).")
+    p_manual_sl.set_defaults(fn=cmd_trade_manual_sell_limit)
+
+    p_manual_loop = manual_sub.add_parser("loop", help="Manual loop trading mode (human-only; BUY→SELL→BUY…).")
+    _add_common_paths(p_manual_loop)
+    loop_sub = p_manual_loop.add_subparsers(dest="loop_cmd", required=True)
+
+    p_loop_create = loop_sub.add_parser("create", help="Create a stored loop preset (no exchange side effects).")
+    _add_common_paths(p_loop_create)
+    p_loop_create.add_argument("--name", default=None, help="Optional preset name.")
+    p_loop_create.add_argument("--notes", default=None, help="Optional notes.")
+    p_loop_create.add_argument("--symbol", required=True, help="Symbol (e.g. SOLUSDT).")
+    p_loop_create.add_argument("--quote-qty", required=True, help="Quote amount to spend each BUY (e.g. 1000).")
+    p_loop_create.add_argument("--entry-type", dest="entry_type", choices=["BUY_MARKET", "BUY_LIMIT"], default="BUY_MARKET")
+    p_loop_create.add_argument("--entry-limit-price", default=None, help="Required when --entry-type=BUY_LIMIT.")
+    g_tp_c = p_loop_create.add_mutually_exclusive_group(required=True)
+    g_tp_c.add_argument("--take-profit-abs", default=None, help="Take-profit absolute offset in quote (e.g. 0.50).")
+    g_tp_c.add_argument("--take-profit-pct", default=None, help="Take-profit percent (e.g. 1.0).")
+    g_rb_c = p_loop_create.add_mutually_exclusive_group(required=False)
+    g_rb_c.add_argument("--rebuy-abs", default=None, help='Rebuy abs offset from last sell price (signed; "0.05"=dip, "+0.05"=momentum).')
+    g_rb_c.add_argument("--rebuy-pct", default=None, help='Rebuy pct offset from last sell price (signed; "-1" dip, "+1" momentum).')
+    g_sl_c = p_loop_create.add_mutually_exclusive_group(required=False)
+    g_sl_c.add_argument("--stop-loss-abs", default=None, help="Stop-loss abs below last BUY avg (e.g. 0.50).")
+    g_sl_c.add_argument("--stop-loss-pct", default=None, help="Stop-loss pct below last BUY avg (e.g. 1.0).")
+    p_loop_create.add_argument(
+        "--stop-loss-action",
+        choices=["stop_only", "stop_and_exit"],
+        default="stop_only",
+        help="When stop-loss hits: stop_only (default) or stop_and_exit (market sell).",
+    )
+    p_loop_create.add_argument(
+        "--cleanup-policy",
+        choices=["cancel-open", "none", "cancel-open-and-exit"],
+        default="cancel-open",
+        help="When loop stops/completes: cancel-open (default), none, or cancel-open-and-exit (market sell).",
+    )
+    p_loop_create.set_defaults(fn=cmd_trade_manual_loop_create)
+
+    p_loop_start = loop_sub.add_parser("start", help="Start a new manual loop session.")
+    _add_common_paths(p_loop_start)
+    _add_exchange_tls_args(p_loop_start)
+    p_loop_start.add_argument("--i-am-human", action="store_true", required=True, help="Required safety flag.")
+    p_loop_start.add_argument("--dry-run", action="store_true", help="Preview + live checks only; do not submit/cancel.")
+    p_loop_start.add_argument("--yes", action="store_true", help="Skip confirmation prompt.")
+    p_loop_start.add_argument("--id", type=int, default=None, help="Start from a stored preset id.")
+    p_loop_start.add_argument("--symbol", required=False, default=None, help="Symbol (e.g. SOLUSDT). Ignored when --id is used.")
+    p_loop_start.add_argument("--quote-qty", required=False, default=None, help="Quote amount to spend each BUY. Ignored when --id is used.")
+    p_loop_start.add_argument("--entry-type", dest="entry_type", choices=["BUY_MARKET", "BUY_LIMIT"], default="BUY_MARKET")
+    p_loop_start.add_argument("--entry-limit-price", default=None, help="Required when --entry-type=BUY_LIMIT.")
+    g_tp = p_loop_start.add_mutually_exclusive_group(required=False)
+    g_tp.add_argument("--take-profit-abs", default=None, help="Take-profit absolute offset in quote (e.g. 0.50).")
+    g_tp.add_argument("--take-profit-pct", default=None, help="Take-profit percent (e.g. 1.0).")
+    g_rb = p_loop_start.add_mutually_exclusive_group(required=False)
+    g_rb.add_argument("--rebuy-abs", default=None, help='Rebuy abs offset from last sell price (signed; "0.05"=dip, "+0.05"=momentum).')
+    g_rb.add_argument("--rebuy-pct", default=None, help='Rebuy pct offset from last sell price (signed; "-1" dip, "+1" momentum).')
+    g_sl = p_loop_start.add_mutually_exclusive_group(required=False)
+    g_sl.add_argument("--stop-loss-abs", default=None, help="Stop-loss abs below last BUY avg (e.g. 0.50).")
+    g_sl.add_argument("--stop-loss-pct", default=None, help="Stop-loss pct below last BUY avg (e.g. 1.0).")
+    p_loop_start.add_argument(
+        "--stop-loss-action",
+        choices=["stop_only", "stop_and_exit"],
+        default=None,
+        help="Override preset stop-loss action: stop_only or stop_and_exit (market sell).",
+    )
+    p_loop_start.add_argument(
+        "--cleanup-policy",
+        choices=["cancel-open", "none", "cancel-open-and-exit"],
+        default=None,
+        help="Override preset cleanup policy: cancel-open, none, cancel-open-and-exit.",
+    )
+    p_loop_start.add_argument("--max-cycles", type=int, default=1, help="0=infinite; default=1.")
+    p_loop_start.add_argument("--interval-seconds", type=int, default=6, help="Runner tick interval (default: 6).")
+    p_loop_start.add_argument(
+        "--duration-seconds",
+        type=int,
+        default=None,
+        help="Stop the local runner after this many seconds (default: run until stopped/completed).",
+    )
+    p_loop_start.add_argument("--no-run", action="store_true", help="Submit entry order and exit (advanced).")
+    p_loop_start.set_defaults(fn=cmd_trade_manual_loop_start)
+
+    p_loop_status = loop_sub.add_parser("status", help="Show loop session status.")
+    _add_common_paths(p_loop_status)
+    p_loop_status.add_argument("--loop-id", type=int, default=None, help="Loop id (default: latest running, else latest).")
+    p_loop_status.set_defaults(fn=cmd_trade_manual_loop_status)
+
+    p_loop_list = loop_sub.add_parser("list", help="List loop sessions.")
+    _add_common_paths(p_loop_list)
+    p_loop_list.add_argument("--limit", type=int, default=20, help="Limit rows (default: 20).")
+    p_loop_list.set_defaults(fn=cmd_trade_manual_loop_list)
+
+    p_loop_stop = loop_sub.add_parser("stop", help="Stop a loop and cancel any open order (asks for confirmation).")
+    _add_common_paths(p_loop_stop)
+    _add_exchange_tls_args(p_loop_stop)
+    p_loop_stop.add_argument("--i-am-human", action="store_true", required=True, help="Required safety flag.")
+    p_loop_stop.add_argument("--loop-id", type=int, default=None, help="Loop id (default: latest running, else latest).")
+    p_loop_stop.set_defaults(fn=cmd_trade_manual_loop_stop)
+
+    p_loop_recon = loop_sub.add_parser("reconcile", help="Reconcile a loop session and advance if legs are fully filled.")
+    _add_common_paths(p_loop_recon)
+    _add_exchange_tls_args(p_loop_recon)
+    p_loop_recon.add_argument("--i-am-human", action="store_true", required=True, help="Required safety flag.")
+    p_loop_recon.add_argument("--loop-id", type=int, default=None, help="Loop id (default: latest running, else latest).")
+    p_loop_recon.add_argument("--loop", action="store_true", help="Run repeatedly until stopped.")
+    p_loop_recon.add_argument("--interval-seconds", type=int, default=60, help="Sleep between loops (default: 60).")
+    p_loop_recon.add_argument("--duration-seconds", type=int, default=None, help="Stop after this many seconds (default: run until stopped).")
+    p_loop_recon.set_defaults(fn=cmd_trade_manual_loop_reconcile)
+
+    p_loop_preset = loop_sub.add_parser("preset", help="Manage stored loop presets.")
+    _add_common_paths(p_loop_preset)
+    preset_sub = p_loop_preset.add_subparsers(dest="preset_cmd", required=True)
+
+    p_loop_preset_list = preset_sub.add_parser("list", help="List stored loop presets.")
+    _add_common_paths(p_loop_preset_list)
+    p_loop_preset_list.add_argument("--limit", type=int, default=50, help="Limit rows (default: 50).")
+    p_loop_preset_list.set_defaults(fn=cmd_trade_manual_loop_preset_list)
+
+    p_loop_preset_show = preset_sub.add_parser("show", help="Show one stored loop preset.")
+    _add_common_paths(p_loop_preset_show)
+    p_loop_preset_show.add_argument("preset_id", type=int, help="Preset id.")
+    p_loop_preset_show.set_defaults(fn=cmd_trade_manual_loop_preset_show)
+
     p_trade_reconcile = trade_sub.add_parser("reconcile", help="Reconcile executions with Binance (supports LIMIT timeout expiry).")
     _add_common_paths(p_trade_reconcile)
     _add_exchange_tls_args(p_trade_reconcile)
     p_trade_reconcile.add_argument("--limit", type=int, default=50, help="Limit executions checked (default: 50).")
+    p_trade_reconcile.add_argument("--loop", action="store_true", help="Run reconciliation repeatedly until stopped.")
+    p_trade_reconcile.add_argument("--interval-seconds", type=int, default=60, help="Sleep between loops (default: 60).")
+    p_trade_reconcile.add_argument("--duration-seconds", type=int, default=None, help="Stop after this many seconds (default: run until stopped).")
     p_trade_reconcile.add_argument(
         "--limit-order-timeout-minutes",
         type=int,
@@ -2234,9 +6946,71 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p_trade_reconcile.set_defaults(fn=cmd_trade_reconcile)
 
+    p_trade_reconcile_all = trade_sub.add_parser(
+        "reconcile-all",
+        help="Reconcile both executions and manual orders (convenience wrapper).",
+    )
+    _add_common_paths(p_trade_reconcile_all)
+    _add_exchange_tls_args(p_trade_reconcile_all)
+    p_trade_reconcile_all.add_argument("--limit", type=int, default=50, help="Limit executions checked (default: 50).")
+    p_trade_reconcile_all.add_argument("--loop", action="store_true", help="Run reconciliation repeatedly until stopped.")
+    p_trade_reconcile_all.add_argument("--interval-seconds", type=int, default=60, help="Sleep between loops (default: 60).")
+    p_trade_reconcile_all.add_argument("--duration-seconds", type=int, default=None, help="Stop after this many seconds (default: run until stopped).")
+    p_trade_reconcile_all.add_argument(
+        "--limit-order-timeout-minutes",
+        type=int,
+        default=30,
+        help="Mark open LIMIT executions as expired after this many minutes (default: 30).",
+    )
+    p_trade_reconcile_all.add_argument(
+        "--auto-cancel-expired",
+        action="store_true",
+        default=None,
+        help="Cancel expired LIMIT orders on Binance (default from config: trading.auto_cancel_expired_limit_orders).",
+    )
+    p_trade_reconcile_all.add_argument("--manual-order-id", type=int, default=None, help="Reconcile only this manual order id.")
+    p_trade_reconcile_all.set_defaults(fn=cmd_trade_reconcile_all)
+
     p_menu = sub.add_parser("menu", help="Interactive menu wrapper over subcommands.")
     _add_common_paths(p_menu)
     p_menu.set_defaults(fn=cmd_menu)
+
+    p_dust = sub.add_parser("dust", help="Dust ledger (accounting-only leftover balances).")
+    _add_common_paths(p_dust)
+    dust_sub = p_dust.add_subparsers(dest="dust_cmd", required=True)
+
+    p_dust_list = dust_sub.add_parser("list", help="List dust ledger rows.")
+    _add_common_paths(p_dust_list)
+    p_dust_list.add_argument("--limit", type=int, default=200, help="Limit rows (default: 200).")
+    p_dust_list.set_defaults(fn=cmd_dust_list)
+
+    p_dust_show = dust_sub.add_parser("show", help="Show one dust ledger asset.")
+    _add_common_paths(p_dust_show)
+    p_dust_show.add_argument("asset", help="Asset symbol (e.g. SOL).")
+    p_dust_show.set_defaults(fn=cmd_dust_show)
+
+    p_pnl = sub.add_parser("pnl", help="Profit and loss helpers (realized/unrealized).")
+    _add_common_paths(p_pnl)
+    pnl_sub = p_pnl.add_subparsers(dest="pnl_cmd", required=True)
+
+    p_pnl_real = pnl_sub.add_parser("realized", help="Realized PnL from SELL executions (Phase 7).")
+    _add_common_paths(p_pnl_real)
+    real_sub = p_pnl_real.add_subparsers(dest="real_cmd", required=False)
+    p_pnl_real.add_argument("--limit", type=int, default=50, help="Limit rows (default: 50).")
+    p_pnl_real.set_defaults(fn=cmd_pnl_realized_list)
+
+    p_pnl_real_show = real_sub.add_parser("show", help="Show realized PnL details for one execution.")
+    _add_common_paths(p_pnl_real_show)
+    p_pnl_real_show.add_argument("execution_id", type=int, help="Execution id.")
+    p_pnl_real_show.set_defaults(fn=cmd_pnl_realized_show)
+
+    p_pnl_unreal = pnl_sub.add_parser("unrealized", help="Unrealized PnL for open positions (Phase 8).")
+    _add_common_paths(p_pnl_unreal)
+    _add_exchange_tls_args(p_pnl_unreal)
+    p_pnl_unreal.add_argument("--position-id", type=int, default=None, help="Optional position id.")
+    p_pnl_unreal.add_argument("--limit", type=int, default=50, help="Limit rows (default: 50).")
+    p_pnl_unreal.add_argument("--no-live", action="store_true", help="Do not fetch live price; print entry/qty only.")
+    p_pnl_unreal.set_defaults(fn=cmd_pnl_unrealized)
 
     return parser
 

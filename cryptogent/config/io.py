@@ -36,6 +36,24 @@ def _as_bool(value: object, default: bool) -> bool:
     return default
 
 
+def _as_optional_bool(value: object) -> bool | None:
+    if value is None:
+        return None
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return bool(value)
+    if isinstance(value, str):
+        v = value.strip().lower()
+        if v in ("auto", ""):
+            return None
+        if v in ("1", "true", "yes", "y", "on"):
+            return True
+        if v in ("0", "false", "no", "n", "off"):
+            return False
+    return None
+
+
 @dataclass(frozen=True)
 class ConfigPaths:
     config_path: Path
@@ -65,12 +83,14 @@ def ensure_default_config(config_path: Path) -> Path:
                 "timeout_s = 10",
                 "tls_verify = true",
                 '# ca_bundle_path = "/path/to/proxy-ca.pem"',
+                'spot_bnb_burn = "auto"  # true|false|"auto" (sync from Binance via `cryptogent config sync-bnb-burn`)',
                 "# Prefer env vars instead of storing secrets here.",
                 'api_key = ""',
                 'api_secret = ""',
                 "",
                 "[binance_testnet]",
                 "# Used only when [binance].testnet = true (or when CLI --testnet is used).",
+                'spot_bnb_burn = "auto"',
                 'api_key = ""',
                 'api_secret = ""',
                 "",
@@ -78,7 +98,8 @@ def ensure_default_config(config_path: Path) -> Path:
                 'default_exit_asset = "USDT"',
                 'default_budget_mode = "manual"',  # manual | auto
                 "default_stop_loss_pct = 1.0",
-                "auto_cancel_expired_limit_orders = false",
+                "monitoring_interval_seconds = 60",
+                "auto_cancel_expired_limit_orders = true",
                 "",
             ]
         ),
@@ -125,7 +146,19 @@ def load_config(config_path: Path) -> AppConfig:
     default_exit_asset = str(trading.get("default_exit_asset") or "USDT").strip().upper()
     default_budget_mode = str(trading.get("default_budget_mode") or "manual").strip().lower()
     default_stop_loss_pct = str(trading.get("default_stop_loss_pct") or "1.0").strip()
-    auto_cancel_expired_limit_orders = _as_bool(trading.get("auto_cancel_expired_limit_orders"), False)
+    monitoring_interval_seconds = None
+    try:
+        if trading.get("monitoring_interval_seconds") not in (None, ""):
+            monitoring_interval_seconds = int(trading.get("monitoring_interval_seconds"))
+            if monitoring_interval_seconds <= 0:
+                monitoring_interval_seconds = None
+    except Exception:
+        monitoring_interval_seconds = None
+    # Default: true (safe-by-default) so expired LIMIT orders are cancelled automatically unless explicitly disabled.
+    auto_cancel_expired_limit_orders = _as_bool(trading.get("auto_cancel_expired_limit_orders"), True)
+
+    bnb_burn_value = (binance_testnet.get("spot_bnb_burn") if testnet_enabled else binance.get("spot_bnb_burn"))
+    spot_bnb_burn = _as_optional_bool(os.environ.get("CRYPTOGENT_SPOT_BNB_BURN") or bnb_burn_value)
 
     return AppConfig(
         db_path=db_path,
@@ -137,8 +170,10 @@ def load_config(config_path: Path) -> AppConfig:
         binance_timeout_s=timeout_s,
         binance_tls_verify=tls_verify,
         binance_ca_bundle_path=ca_bundle_path,
+        binance_spot_bnb_burn=spot_bnb_burn,
         trading_default_exit_asset=default_exit_asset,
         trading_default_budget_mode=default_budget_mode,
         trading_default_stop_loss_pct=default_stop_loss_pct,
         trading_auto_cancel_expired_limit_orders=auto_cancel_expired_limit_orders,
+        trading_monitoring_interval_seconds=monitoring_interval_seconds,
     )

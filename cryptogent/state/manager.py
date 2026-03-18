@@ -191,6 +191,59 @@ class StateManager:
                 ("CLOSED", now),
             )
         self.upsert_orders(open_orders)
+        # After upsert, classify order source for the currently open set.
+        try:
+            order_ids = [o.exchange_order_id for o in open_orders if getattr(o, "exchange_order_id", None)]
+            self.set_order_sources_for_exchange_order_ids(order_ids)
+        except Exception:
+            return
+
+    def set_order_sources_for_exchange_order_ids(self, exchange_order_ids: Iterable[str | None]) -> None:
+        """
+        Set orders.order_source for the given exchange order ids.
+
+        Values:
+          - execution: orderId exists in executions.binance_order_id
+          - manual: orderId exists in manual_orders.binance_order_id
+          - manual: orderId exists in loop_legs.binance_order_id (manual loop trading)
+          - external: default when unknown
+        """
+        ids = [str(x).strip() for x in exchange_order_ids if x not in (None, "", "None")]
+        if not ids:
+            return
+
+        # Default: external.
+        self._conn.executemany("UPDATE orders SET order_source = 'external' WHERE exchange_order_id = ?", [(i,) for i in ids])
+
+        q_marks = ",".join(["?"] * len(ids))
+        # manual takes precedence over external.
+        manual_rows = self._conn.execute(
+            f"SELECT DISTINCT binance_order_id FROM manual_orders WHERE binance_order_id IN ({q_marks})",
+            ids,
+        ).fetchall()
+        for r in manual_rows:
+            oid = str(r["binance_order_id"])
+            if oid:
+                self._conn.execute("UPDATE orders SET order_source = 'manual' WHERE exchange_order_id = ?", (oid,))
+
+        loop_rows = self._conn.execute(
+            f"SELECT DISTINCT binance_order_id FROM loop_legs WHERE binance_order_id IN ({q_marks})",
+            ids,
+        ).fetchall()
+        for r in loop_rows:
+            oid = str(r["binance_order_id"])
+            if oid:
+                self._conn.execute("UPDATE orders SET order_source = 'manual' WHERE exchange_order_id = ?", (oid,))
+
+        # execution takes precedence over manual/external.
+        exec_rows = self._conn.execute(
+            f"SELECT DISTINCT binance_order_id FROM executions WHERE binance_order_id IN ({q_marks})",
+            ids,
+        ).fetchall()
+        for r in exec_rows:
+            oid = str(r["binance_order_id"])
+            if oid:
+                self._conn.execute("UPDATE orders SET order_source = 'execution' WHERE exchange_order_id = ?", (oid,))
 
     def get_last_sync(self) -> dict | None:
         cur = self._conn.execute(
@@ -206,6 +259,39 @@ class StateManager:
     def get_open_order_count(self) -> int:
         cur = self._conn.execute("SELECT COUNT(*) AS n FROM orders WHERE status IN ('NEW','PARTIALLY_FILLED')")
         return int(cur.fetchone()["n"])
+
+    def list_open_orders_for_reconcile(self, *, limit: int = 200) -> list[dict]:
+        cur = self._conn.execute(
+            """
+            SELECT exchange_order_id, symbol, status, updated_at_utc
+            FROM orders
+            WHERE status IN ('NEW','PARTIALLY_FILLED') AND exchange_order_id IS NOT NULL
+            ORDER BY updated_at_utc DESC
+            LIMIT ?
+            """,
+            (int(limit),),
+        )
+        return [dict(r) for r in cur.fetchall()]
+
+    def list_open_orders_for_reconcile_by_source(self, *, order_source: str, limit: int = 200) -> list[dict]:
+        cur = self._conn.execute(
+            """
+            SELECT exchange_order_id, symbol, status, updated_at_utc
+            FROM orders
+            WHERE status IN ('NEW','PARTIALLY_FILLED')
+              AND exchange_order_id IS NOT NULL
+              AND order_source = ?
+            ORDER BY updated_at_utc DESC
+            LIMIT ?
+            """,
+            (str(order_source), int(limit)),
+        )
+        return [dict(r) for r in cur.fetchall()]
+
+    def get_execution_by_binance_order_id(self, *, binance_order_id: str) -> dict | None:
+        cur = self._conn.execute("SELECT * FROM executions WHERE binance_order_id = ?", (str(binance_order_id),))
+        row = cur.fetchone()
+        return dict(row) if row else None
 
     def create_trade_request(self, req: ValidatedTradeRequest) -> int:
         now = utcnow_iso()
@@ -328,7 +414,7 @@ class StateManager:
 
     def list_open_orders(self, *, symbol: str | None = None, limit: int | None = None) -> list[dict]:
         sql = (
-            "SELECT exchange_order_id, symbol, side, type, status, price, quantity, filled_quantity, "
+            "SELECT exchange_order_id, order_source, symbol, side, type, status, price, quantity, filled_quantity, "
             "created_at_utc, updated_at_utc "
             "FROM orders WHERE status IN ('NEW','PARTIALLY_FILLED')"
         )
@@ -598,6 +684,10 @@ class StateManager:
         total_quote_spent: str | None,
         commission_total: str | None,
         commission_asset: str | None,
+        fee_breakdown_json: str | None = None,
+        realized_pnl_quote: str | None = None,
+        realized_pnl_quote_asset: str | None = None,
+        pnl_warnings_json: str | None = None,
         fills_count: int | None,
         retry_count: int,
         message: str,
@@ -618,6 +708,10 @@ class StateManager:
                 total_quote_spent = ?,
                 commission_total = ?,
                 commission_asset = ?,
+                fee_breakdown_json = COALESCE(?, fee_breakdown_json),
+                realized_pnl_quote = COALESCE(?, realized_pnl_quote),
+                realized_pnl_quote_asset = COALESCE(?, realized_pnl_quote_asset),
+                pnl_warnings_json = COALESCE(?, pnl_warnings_json),
                 fills_count = ?,
                 retry_count = ?,
                 submitted_at_utc = COALESCE(submitted_at_utc, ?),
@@ -635,6 +729,10 @@ class StateManager:
                 total_quote_spent,
                 commission_total,
                 commission_asset,
+                fee_breakdown_json,
+                realized_pnl_quote,
+                realized_pnl_quote_asset,
+                pnl_warnings_json,
                 fills_count,
                 int(retry_count),
                 submitted_at_utc,
@@ -763,8 +861,16 @@ class StateManager:
         self,
         *,
         symbol: str,
+        base_asset: str | None,
+        quote_asset: str | None,
+        market_data_environment: str,
+        execution_environment: str,
         entry_price: str,
         quantity: str,
+        source_execution_id: int | None = None,
+        gross_quantity: str | None = None,
+        fee_amount: str | None = None,
+        fee_asset: str | None = None,
         stop_loss_price: str,
         profit_target_price: str,
         deadline_utc: str,
@@ -773,15 +879,27 @@ class StateManager:
         cur = self._conn.execute(
             """
             INSERT INTO positions(
-              symbol, entry_price, quantity, stop_loss_price, profit_target_price, deadline_utc,
+              symbol, base_asset, quote_asset,
+              market_data_environment, execution_environment,
+              entry_price, quantity,
+              source_execution_id, gross_quantity, fee_amount, fee_asset,
+              stop_loss_price, profit_target_price, deadline_utc,
               status, opened_at_utc, created_at_utc, updated_at_utc
             )
-            VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 symbol,
+                base_asset,
+                quote_asset,
+                market_data_environment,
+                execution_environment,
                 entry_price,
                 quantity,
+                int(source_execution_id) if source_execution_id is not None else None,
+                gross_quantity,
+                fee_amount,
+                fee_asset,
                 stop_loss_price,
                 profit_target_price,
                 deadline_utc,
@@ -793,6 +911,140 @@ class StateManager:
         )
         return int(cur.lastrowid)
 
+    def get_open_position_qty_by_asset(self) -> dict[str, Decimal]:
+        cur = self._conn.execute("SELECT base_asset, quantity FROM positions WHERE status = 'OPEN' AND base_asset IS NOT NULL")
+        out: dict[str, Decimal] = {}
+        for r in cur.fetchall():
+            asset = str(r["base_asset"] or "").strip().upper()
+            if not asset:
+                continue
+            try:
+                qty = Decimal(str(r["quantity"]))
+            except (InvalidOperation, ValueError):
+                continue
+            out[asset] = out.get(asset, Decimal("0")) + qty
+        return out
+
+    def get_dust(self, *, asset: str) -> dict | None:
+        cur = self._conn.execute("SELECT * FROM dust_ledger WHERE asset = ?", (asset.strip().upper(),))
+        row = cur.fetchone()
+        return dict(row) if row else None
+
+    def list_dust(self, *, limit: int = 200) -> list[dict]:
+        cur = self._conn.execute("SELECT * FROM dust_ledger ORDER BY updated_at_utc DESC LIMIT ?", (int(limit),))
+        return [dict(r) for r in cur.fetchall()]
+
+    def add_dust(
+        self,
+        *,
+        asset: str,
+        dust_qty: str,
+        avg_cost_price: str,
+        needs_reconcile: bool = True,
+    ) -> None:
+        """
+        Add dust to the per-asset dust ledger using weighted average cost.
+
+        Dust ledger is accounting-only and must not be used as a tradable source of truth.
+        """
+        asset_u = asset.strip().upper()
+        if not asset_u:
+            return
+        try:
+            add_qty = Decimal(str(dust_qty))
+            add_cost = Decimal(str(avg_cost_price))
+        except (InvalidOperation, ValueError):
+            return
+        if add_qty <= 0 or add_cost <= 0:
+            return
+
+        now = utcnow_iso()
+        row = self.get_dust(asset=asset_u)
+        if not row:
+            self._conn.execute(
+                """
+                INSERT INTO dust_ledger(asset, dust_qty, avg_cost_price, needs_reconcile, created_at_utc, updated_at_utc)
+                VALUES(?, ?, ?, ?, ?, ?)
+                """,
+                (asset_u, str(add_qty), str(add_cost), 1 if needs_reconcile else 0, now, now),
+            )
+            return
+
+        try:
+            prev_qty = Decimal(str(row.get("dust_qty") or "0"))
+            prev_cost = Decimal(str(row.get("avg_cost_price") or "0"))
+        except (InvalidOperation, ValueError):
+            prev_qty = Decimal("0")
+            prev_cost = Decimal("0")
+
+        new_total = prev_qty + add_qty
+        if new_total <= 0:
+            new_total = Decimal("0")
+            new_cost = add_cost
+        elif prev_qty <= 0 or prev_cost <= 0:
+            new_cost = add_cost
+        else:
+            new_cost = ((prev_qty * prev_cost) + (add_qty * add_cost)) / new_total
+
+        self._conn.execute(
+            """
+            UPDATE dust_ledger
+            SET dust_qty = ?,
+                avg_cost_price = ?,
+                needs_reconcile = ?,
+                updated_at_utc = ?
+            WHERE asset = ?
+            """,
+            (str(new_total), str(new_cost), 1 if needs_reconcile else int(row.get("needs_reconcile") or 0), now, asset_u),
+        )
+
+    def reconcile_dust_ledger(self, *, balances: Iterable[Balance]) -> None:
+        """
+        Clamp dust ledger against Binance free balances minus open-position quantities.
+        """
+        free_by_asset: dict[str, Decimal] = {}
+        for b in balances:
+            try:
+                free_by_asset[str(b.asset).strip().upper()] = Decimal(str(b.free))
+            except (InvalidOperation, ValueError):
+                continue
+        open_pos_qty = self.get_open_position_qty_by_asset()
+
+        for row in self.list_dust(limit=500):
+            asset = str(row.get("asset") or "").strip().upper()
+            if not asset:
+                continue
+            try:
+                dust_qty = Decimal(str(row.get("dust_qty") or "0"))
+            except (InvalidOperation, ValueError):
+                continue
+            free = free_by_asset.get(asset, Decimal("0"))
+            reserved = open_pos_qty.get(asset, Decimal("0"))
+            allowed = free - reserved
+            if allowed < 0:
+                allowed = Decimal("0")
+            effective = dust_qty if dust_qty <= allowed else allowed
+
+            needs = int(row.get("needs_reconcile") or 0)
+            if effective != dust_qty or needs:
+                now = utcnow_iso()
+                self._conn.execute(
+                    "UPDATE dust_ledger SET dust_qty = ?, needs_reconcile = 0, updated_at_utc = ? WHERE asset = ?",
+                    (str(effective), now, asset),
+                )
+                if effective != dust_qty:
+                    self.append_audit(
+                        level="WARN",
+                        event="dust_ledger_clamped",
+                        details={
+                            "asset": asset,
+                            "prev_dust_qty": str(dust_qty),
+                            "new_dust_qty": str(effective),
+                            "binance_free": str(free),
+                            "open_position_qty": str(reserved),
+                        },
+                    )
+
     def get_active_position(self, *, symbol: str | None = None) -> dict | None:
         if symbol:
             cur = self._conn.execute(
@@ -801,6 +1053,11 @@ class StateManager:
             )
         else:
             cur = self._conn.execute("SELECT * FROM positions WHERE status = 'OPEN' ORDER BY id DESC LIMIT 1")
+        row = cur.fetchone()
+        return dict(row) if row else None
+
+    def get_position(self, *, position_id: int) -> dict | None:
+        cur = self._conn.execute("SELECT * FROM positions WHERE id = ?", (int(position_id),))
         row = cur.fetchone()
         return dict(row) if row else None
 
@@ -816,9 +1073,679 @@ class StateManager:
         )
         return int(cur.rowcount) > 0
 
+    def update_position_quantity(self, *, position_id: int, quantity: str) -> bool:
+        now = utcnow_iso()
+        cur = self._conn.execute(
+            """
+            UPDATE positions
+            SET quantity = ?, updated_at_utc = ?
+            WHERE id = ? AND status = 'OPEN'
+            """,
+            (quantity, now, int(position_id)),
+        )
+        return int(cur.rowcount) > 0
+
+    def update_position_last_monitored(self, *, position_id: int, at_utc: str) -> None:
+        self._conn.execute(
+            "UPDATE positions SET last_monitored_at_utc = ?, updated_at_utc = ? WHERE id = ?",
+            (at_utc, utcnow_iso(), int(position_id)),
+        )
+
+    def list_positions(self, *, status: str | None = None, limit: int = 50) -> list[dict]:
+        if status:
+            cur = self._conn.execute(
+                "SELECT * FROM positions WHERE status = ? ORDER BY id DESC LIMIT ?",
+                (status, int(limit)),
+            )
+        else:
+            cur = self._conn.execute("SELECT * FROM positions ORDER BY id DESC LIMIT ?", (int(limit),))
+        return [dict(r) for r in cur.fetchall()]
+
     def list_audit_logs(self, *, limit: int = 50) -> list[dict]:
         cur = self._conn.execute(
             "SELECT created_at_utc, level, event, details_json FROM audit_logs ORDER BY id DESC LIMIT ?",
             (int(limit),),
+        )
+        return [dict(r) for r in cur.fetchall()]
+
+    def create_monitoring_event(
+        self,
+        *,
+        position_id: int,
+        symbol: str,
+        entry_price: str | None,
+        current_price: str | None,
+        pnl_percent: str | None,
+        decision: str,
+        exit_reason: str | None,
+        deadline_utc: str | None,
+        position_status: str | None,
+        error_code: str | None,
+        error_message: str | None,
+    ) -> int:
+        now = utcnow_iso()
+        cur = self._conn.execute(
+            """
+            INSERT INTO monitoring_events(
+              position_id, created_at_utc, symbol,
+              entry_price, current_price, pnl_percent,
+              decision, exit_reason, deadline_utc, position_status,
+              error_code, error_message
+            )
+            VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                int(position_id),
+                now,
+                symbol,
+                entry_price,
+                current_price,
+                pnl_percent,
+                decision,
+                exit_reason,
+                deadline_utc,
+                position_status,
+                error_code,
+                error_message,
+            ),
+        )
+        return int(cur.lastrowid)
+
+    def list_monitoring_events(self, *, limit: int = 50) -> list[dict]:
+        cur = self._conn.execute(
+            """
+            SELECT monitoring_event_id, position_id, created_at_utc, symbol,
+                   entry_price, current_price, pnl_percent,
+                   decision, exit_reason, deadline_utc, position_status,
+                   error_code, error_message
+            FROM monitoring_events
+            ORDER BY monitoring_event_id DESC
+            LIMIT ?
+            """,
+            (int(limit),),
+        )
+        return [dict(r) for r in cur.fetchall()]
+
+    def create_manual_order(
+        self,
+        *,
+        dry_run: bool,
+        execution_environment: str,
+        base_url: str,
+        symbol: str,
+        side: str,
+        order_type: str,
+        time_in_force: str | None,
+        limit_price: str | None,
+        quote_order_qty: str | None,
+        quantity: str | None,
+        client_order_id: str,
+        message: str | None,
+        details_json: str | None,
+    ) -> int:
+        now = utcnow_iso()
+        cur = self._conn.execute(
+            """
+            INSERT INTO manual_orders(
+              created_at_utc, updated_at_utc,
+              dry_run, execution_environment, base_url,
+              symbol, side, order_type, time_in_force, limit_price,
+              quote_order_qty, quantity, client_order_id,
+              binance_order_id, local_status, raw_status, retry_count,
+              executed_quantity, avg_fill_price, total_quote_value,
+              fee_breakdown_json, message, details_json
+            )
+            VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                now,
+                now,
+                1 if dry_run else 0,
+                execution_environment,
+                base_url,
+                symbol,
+                side,
+                order_type,
+                time_in_force,
+                limit_price,
+                quote_order_qty,
+                quantity,
+                client_order_id,
+                None,
+                "created",
+                None,
+                0,
+                None,
+                None,
+                None,
+                None,
+                message,
+                details_json,
+            ),
+        )
+        return int(cur.lastrowid)
+
+    def update_manual_order(
+        self,
+        *,
+        manual_order_id: int,
+        local_status: str,
+        raw_status: str | None,
+        binance_order_id: str | None,
+        retry_count: int,
+        executed_quantity: str | None,
+        avg_fill_price: str | None,
+        total_quote_value: str | None,
+        fee_breakdown_json: str | None,
+        message: str | None,
+        details_json: str | None,
+    ) -> None:
+        now = utcnow_iso()
+        self._conn.execute(
+            """
+            UPDATE manual_orders
+            SET updated_at_utc = ?,
+                local_status = ?,
+                raw_status = ?,
+                binance_order_id = ?,
+                retry_count = ?,
+                executed_quantity = ?,
+                avg_fill_price = ?,
+                total_quote_value = ?,
+                fee_breakdown_json = COALESCE(?, fee_breakdown_json),
+                message = COALESCE(?, message),
+                details_json = COALESCE(?, details_json)
+            WHERE manual_order_id = ?
+            """,
+            (
+                now,
+                local_status,
+                raw_status,
+                binance_order_id,
+                int(retry_count),
+                executed_quantity,
+                avg_fill_price,
+                total_quote_value,
+                fee_breakdown_json,
+                message,
+                details_json,
+                int(manual_order_id),
+            ),
+        )
+
+    def list_manual_orders(self, *, limit: int = 20) -> list[dict]:
+        cur = self._conn.execute(
+            """
+            SELECT manual_order_id, created_at_utc, dry_run, execution_environment,
+                   symbol, side, order_type, local_status, raw_status,
+                   quote_order_qty, quantity, limit_price, binance_order_id, client_order_id
+            FROM manual_orders
+            ORDER BY manual_order_id DESC
+            LIMIT ?
+            """,
+            (int(limit),),
+        )
+        return [dict(r) for r in cur.fetchall()]
+
+    def get_manual_order(self, *, manual_order_id: int) -> dict | None:
+        cur = self._conn.execute("SELECT * FROM manual_orders WHERE manual_order_id = ?", (int(manual_order_id),))
+        row = cur.fetchone()
+        return dict(row) if row else None
+
+    def list_manual_orders_for_reconcile(self, *, limit: int = 50) -> list[dict]:
+        cur = self._conn.execute(
+            """
+            SELECT * FROM manual_orders
+            WHERE local_status IN ('created','submitting','submitted','open','partially_filled','uncertain_submitted','retry_submitted')
+            ORDER BY manual_order_id DESC
+            LIMIT ?
+            """,
+            (int(limit),),
+        )
+        return [dict(r) for r in cur.fetchall()]
+
+    # ---- Manual loop trading mode (Phase 12) ----
+
+    def create_loop_session(
+        self,
+        *,
+        dry_run: bool,
+        status: str,
+        execution_environment: str,
+        base_url: str,
+        preset_id: int | None,
+        symbol: str,
+        quote_qty: str,
+        entry_order_type: str,
+        entry_limit_price: str | None,
+        take_profit_kind: str,
+        take_profit_value: str,
+        rebuy_kind: str | None,
+        rebuy_value: str | None,
+        stop_loss_kind: str | None,
+        stop_loss_value: str | None,
+        stop_loss_action: str,
+        cleanup_policy: str,
+        max_cycles: int,
+        state: str,
+        pnl_quote_asset: str | None,
+    ) -> int:
+        now = utcnow_iso()
+        cur = self._conn.execute(
+            """
+            INSERT INTO loop_sessions(
+              created_at_utc, updated_at_utc,
+              dry_run, status, execution_environment, base_url,
+              preset_id, symbol, quote_qty,
+              entry_order_type, entry_limit_price,
+              take_profit_kind, take_profit_value,
+              rebuy_kind, rebuy_value,
+              stop_loss_kind, stop_loss_value, stop_loss_action, cleanup_policy,
+              max_cycles, cycles_completed, state,
+              cumulative_realized_pnl_quote, pnl_quote_asset,
+              stopped_at_utc, last_error, last_warning,
+              last_buy_leg_id, last_sell_leg_id,
+              last_buy_avg_price, last_sell_avg_price,
+              last_buy_executed_qty, last_sell_executed_qty
+            )
+            VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, NULL, ?, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL)
+            """,
+            (
+                now,
+                now,
+                1 if dry_run else 0,
+                status,
+                execution_environment,
+                base_url,
+                int(preset_id) if preset_id is not None else None,
+                symbol,
+                quote_qty,
+                entry_order_type,
+                entry_limit_price,
+                take_profit_kind,
+                take_profit_value,
+                rebuy_kind,
+                rebuy_value,
+                stop_loss_kind,
+                stop_loss_value,
+                stop_loss_action,
+                cleanup_policy,
+                int(max_cycles),
+                state,
+                pnl_quote_asset,
+            ),
+        )
+        return int(cur.lastrowid)
+
+    def update_loop_session(
+        self,
+        *,
+        loop_id: int,
+        status: str | None = None,
+        state: str | None = None,
+        cycles_completed: int | None = None,
+        last_buy_leg_id: int | None = None,
+        last_sell_leg_id: int | None = None,
+        last_buy_avg_price: str | None = None,
+        last_sell_avg_price: str | None = None,
+        last_buy_executed_qty: str | None = None,
+        last_sell_executed_qty: str | None = None,
+        cumulative_realized_pnl_quote: str | None = None,
+        stopped_at_utc: str | None = None,
+        last_error: str | None = None,
+        last_warning: str | None = None,
+    ) -> None:
+        now = utcnow_iso()
+        # COALESCE keeps previous value when None.
+        self._conn.execute(
+            """
+            UPDATE loop_sessions
+            SET updated_at_utc = ?,
+                status = COALESCE(?, status),
+                state = COALESCE(?, state),
+                cycles_completed = COALESCE(?, cycles_completed),
+                last_buy_leg_id = COALESCE(?, last_buy_leg_id),
+                last_sell_leg_id = COALESCE(?, last_sell_leg_id),
+                last_buy_avg_price = COALESCE(?, last_buy_avg_price),
+                last_sell_avg_price = COALESCE(?, last_sell_avg_price),
+                last_buy_executed_qty = COALESCE(?, last_buy_executed_qty),
+                last_sell_executed_qty = COALESCE(?, last_sell_executed_qty),
+                cumulative_realized_pnl_quote = COALESCE(?, cumulative_realized_pnl_quote),
+                stopped_at_utc = COALESCE(?, stopped_at_utc),
+                last_error = COALESCE(?, last_error),
+                last_warning = COALESCE(?, last_warning)
+            WHERE loop_id = ?
+            """,
+            (
+                now,
+                status,
+                state,
+                cycles_completed,
+                last_buy_leg_id,
+                last_sell_leg_id,
+                last_buy_avg_price,
+                last_sell_avg_price,
+                last_buy_executed_qty,
+                last_sell_executed_qty,
+                cumulative_realized_pnl_quote,
+                stopped_at_utc,
+                last_error,
+                last_warning,
+                int(loop_id),
+            ),
+        )
+
+    def get_loop_session(self, *, loop_id: int) -> dict | None:
+        cur = self._conn.execute("SELECT * FROM loop_sessions WHERE loop_id = ?", (int(loop_id),))
+        row = cur.fetchone()
+        return dict(row) if row else None
+
+    def list_loop_sessions(self, *, limit: int = 20) -> list[dict]:
+        cur = self._conn.execute(
+            """
+            SELECT loop_id, created_at_utc, dry_run, status, execution_environment, symbol,
+                   quote_qty, entry_order_type, max_cycles, cycles_completed,
+                   cumulative_realized_pnl_quote, pnl_quote_asset, last_error
+            FROM loop_sessions
+            ORDER BY loop_id DESC
+            LIMIT ?
+            """,
+            (int(limit),),
+        )
+        return [dict(r) for r in cur.fetchall()]
+
+    def get_latest_loop_session(self, *, status: str | None = None) -> dict | None:
+        if status:
+            cur = self._conn.execute(
+                "SELECT * FROM loop_sessions WHERE status = ? ORDER BY loop_id DESC LIMIT 1",
+                (status,),
+            )
+        else:
+            cur = self._conn.execute("SELECT * FROM loop_sessions ORDER BY loop_id DESC LIMIT 1")
+        row = cur.fetchone()
+        return dict(row) if row else None
+
+    def create_loop_leg(
+        self,
+        *,
+        loop_id: int,
+        cycle_index: int,
+        leg_role: str,
+        side: str,
+        order_type: str,
+        time_in_force: str | None,
+        limit_price: str | None,
+        quote_order_qty: str | None,
+        quantity: str | None,
+        client_order_id: str,
+        message: str | None,
+    ) -> int:
+        now = utcnow_iso()
+        cur = self._conn.execute(
+            """
+            INSERT INTO loop_legs(
+              loop_id, created_at_utc, updated_at_utc,
+              cycle_index, leg_role, side, order_type,
+              time_in_force, limit_price, quote_order_qty, quantity,
+              client_order_id, binance_order_id,
+              local_status, raw_status, retry_count,
+              executed_quantity, avg_fill_price, total_quote_value,
+              fee_breakdown_json, message, submitted_at_utc, reconciled_at_utc, filled_at_utc
+            )
+            VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, NULL, NULL, NULL, NULL, ?, NULL, NULL, NULL)
+            """,
+            (
+                int(loop_id),
+                now,
+                now,
+                int(cycle_index),
+                leg_role,
+                side,
+                order_type,
+                time_in_force,
+                limit_price,
+                quote_order_qty,
+                quantity,
+                client_order_id,
+                None,
+                "created",
+                None,
+                message,
+            ),
+        )
+        return int(cur.lastrowid)
+
+    def update_loop_leg(
+        self,
+        *,
+        leg_id: int,
+        local_status: str,
+        raw_status: str | None,
+        binance_order_id: str | None,
+        retry_count: int,
+        executed_quantity: str | None,
+        avg_fill_price: str | None,
+        total_quote_value: str | None,
+        fee_breakdown_json: str | None,
+        message: str | None,
+        submitted_at_utc: str | None = None,
+        reconciled_at_utc: str | None = None,
+        filled_at_utc: str | None = None,
+    ) -> None:
+        now = utcnow_iso()
+        self._conn.execute(
+            """
+            UPDATE loop_legs
+            SET updated_at_utc = ?,
+                local_status = ?,
+                raw_status = ?,
+                binance_order_id = COALESCE(?, binance_order_id),
+                retry_count = ?,
+                executed_quantity = ?,
+                avg_fill_price = ?,
+                total_quote_value = ?,
+                fee_breakdown_json = COALESCE(?, fee_breakdown_json),
+                message = COALESCE(?, message),
+                submitted_at_utc = COALESCE(?, submitted_at_utc),
+                reconciled_at_utc = COALESCE(?, reconciled_at_utc),
+                filled_at_utc = COALESCE(?, filled_at_utc)
+            WHERE leg_id = ?
+            """,
+            (
+                now,
+                local_status,
+                raw_status,
+                binance_order_id,
+                int(retry_count),
+                executed_quantity,
+                avg_fill_price,
+                total_quote_value,
+                fee_breakdown_json,
+                message,
+                submitted_at_utc,
+                reconciled_at_utc,
+                filled_at_utc,
+                int(leg_id),
+            ),
+        )
+
+    def list_loop_legs(self, *, loop_id: int, limit: int = 50) -> list[dict]:
+        cur = self._conn.execute(
+            """
+            SELECT * FROM loop_legs
+            WHERE loop_id = ?
+            ORDER BY leg_id DESC
+            LIMIT ?
+            """,
+            (int(loop_id), int(limit)),
+        )
+        return [dict(r) for r in cur.fetchall()]
+
+    def get_loop_leg(self, *, leg_id: int) -> dict | None:
+        cur = self._conn.execute("SELECT * FROM loop_legs WHERE leg_id = ?", (int(leg_id),))
+        row = cur.fetchone()
+        return dict(row) if row else None
+
+    def get_latest_loop_leg(self, *, loop_id: int) -> dict | None:
+        cur = self._conn.execute(
+            "SELECT * FROM loop_legs WHERE loop_id = ? ORDER BY leg_id DESC LIMIT 1",
+            (int(loop_id),),
+        )
+        row = cur.fetchone()
+        return dict(row) if row else None
+
+    def list_loop_legs_for_reconcile(self, *, loop_id: int, limit: int = 50) -> list[dict]:
+        cur = self._conn.execute(
+            """
+            SELECT * FROM loop_legs
+            WHERE loop_id = ?
+              AND local_status IN ('created','submitting','submitted','open','partially_filled','uncertain_submitted','retry_submitted')
+            ORDER BY leg_id DESC
+            LIMIT ?
+            """,
+            (int(loop_id), int(limit)),
+        )
+        return [dict(r) for r in cur.fetchall()]
+
+    def list_loop_legs_open(self, *, loop_id: int, limit: int = 500) -> list[dict]:
+        cur = self._conn.execute(
+            """
+            SELECT * FROM loop_legs
+            WHERE loop_id = ?
+              AND local_status IN ('created','submitting','submitted','open','partially_filled','uncertain_submitted','retry_submitted')
+            ORDER BY leg_id ASC
+            LIMIT ?
+            """,
+            (int(loop_id), int(limit)),
+        )
+        return [dict(r) for r in cur.fetchall()]
+
+    def append_loop_event(
+        self,
+        *,
+        loop_id: int,
+        event_type: str,
+        preset_id: int | None = None,
+        symbol: str | None = None,
+        side: str | None = None,
+        cycle_number: int | None = None,
+        client_order_id: str | None = None,
+        binance_order_id: str | None = None,
+        price: str | None = None,
+        quantity: str | None = None,
+        message: str | None = None,
+        details: dict | None = None,
+    ) -> int:
+        now = utcnow_iso()
+        cur = self._conn.execute(
+            """
+            INSERT INTO loop_events(
+              loop_id, created_at_utc, event_type,
+              preset_id, symbol, side, cycle_number,
+              client_order_id, binance_order_id, price, quantity,
+              message, details_json
+            )
+            VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                int(loop_id),
+                now,
+                event_type,
+                int(preset_id) if preset_id is not None else None,
+                symbol,
+                side,
+                int(cycle_number) if cycle_number is not None else None,
+                client_order_id,
+                binance_order_id,
+                price,
+                quantity,
+                message,
+                json.dumps(details or {}, separators=(",", ":")),
+            ),
+        )
+        return int(cur.lastrowid)
+
+    # ---- Manual loop presets (saved configs) ----
+
+    def create_loop_preset(
+        self,
+        *,
+        name: str | None,
+        notes: str | None,
+        symbol: str,
+        quote_qty: str,
+        entry_order_type: str,
+        entry_limit_price: str | None,
+        take_profit_kind: str,
+        take_profit_value: str,
+        rebuy_kind: str | None,
+        rebuy_value: str | None,
+        stop_loss_kind: str | None,
+        stop_loss_value: str | None,
+        stop_loss_action: str,
+        cleanup_policy: str,
+    ) -> int:
+        now = utcnow_iso()
+        cur = self._conn.execute(
+            """
+            INSERT INTO loop_presets(
+              created_at_utc, updated_at_utc, name, notes,
+              symbol, quote_qty,
+              entry_order_type, entry_limit_price,
+              take_profit_kind, take_profit_value,
+              rebuy_kind, rebuy_value,
+              stop_loss_kind, stop_loss_value, stop_loss_action, cleanup_policy
+            )
+            VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                now,
+                now,
+                name,
+                notes,
+                symbol,
+                quote_qty,
+                entry_order_type,
+                entry_limit_price,
+                take_profit_kind,
+                take_profit_value,
+                rebuy_kind,
+                rebuy_value,
+                stop_loss_kind,
+                stop_loss_value,
+                stop_loss_action,
+                cleanup_policy,
+            ),
+        )
+        return int(cur.lastrowid)
+
+    def get_loop_preset(self, *, preset_id: int) -> dict | None:
+        cur = self._conn.execute("SELECT * FROM loop_presets WHERE preset_id = ?", (int(preset_id),))
+        row = cur.fetchone()
+        return dict(row) if row else None
+
+    def list_loop_presets(self, *, limit: int = 50) -> list[dict]:
+        cur = self._conn.execute(
+            """
+            SELECT preset_id, created_at_utc, name, symbol, quote_qty, entry_order_type
+            FROM loop_presets
+            ORDER BY preset_id DESC
+            LIMIT ?
+            """,
+            (int(limit),),
+        )
+        return [dict(r) for r in cur.fetchall()]
+
+    def list_loop_events_since(self, *, loop_id: int, after_event_id: int = 0, limit: int = 200) -> list[dict]:
+        cur = self._conn.execute(
+            """
+            SELECT loop_event_id, created_at_utc, event_type, preset_id, symbol, side, cycle_number,
+                   client_order_id, binance_order_id, price, quantity, message, details_json
+            FROM loop_events
+            WHERE loop_id = ? AND loop_event_id > ?
+            ORDER BY loop_event_id ASC
+            LIMIT ?
+            """,
+            (int(loop_id), int(after_event_id), int(limit)),
         )
         return [dict(r) for r in cur.fetchall()]

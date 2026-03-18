@@ -619,6 +619,167 @@ Phase 7 is successful when the system can:
 
 ---
 
+# Phase 7.X — SELL Execution Extensions (Partial Close + Realized PnL + Dust)
+
+> This section extends Phase 7 with locked execution behavior for **MARKET_SELL** and **LIMIT_SELL**.  
+> It does **not modify previous Phase 7 text**.
+
+## 7.X.1 SELL Is Position-Based
+
+SELL execution must operate on a known position lifecycle object.
+
+Rule:
+
+* a SELL execution must reference a position (directly or via a candidate that references a position)
+* SELL must not be “sell from balance” by default in MVP
+
+## 7.X.2 Partial Close Behavior
+
+SELL execution must support partial closes.
+
+Rule:
+
+* `executed_sell_qty` is determined only by the exchange fill result
+* position remaining quantity must decrement by executed filled quantity
+* position must be marked closed only when remaining is zero or dust (see dust policy below)
+
+## 7.X.3 LIMIT_SELL Partial Fill Awareness
+
+LIMIT_SELL orders may remain open and fill incrementally.
+
+Required behavior:
+
+* persist execution state transitions (`open`, `partially_filled`, `filled`)
+* reconciliation must update the execution row from `GET /api/v3/order` (by `origClientOrderId`)
+* position remaining quantity must update only from executed filled quantity
+
+## 7.X.4 Realized PnL (Executed SELL Fills Only)
+
+### MVP Cost Basis
+
+MVP cost basis must use **Average Cost**.
+
+### Realized PnL Timing
+
+Realized PnL must be computed only from **executed SELL fills**, never from:
+
+* requested quantity
+* unfilled limit orders
+* planning snapshots
+
+### Required PnL Inputs
+
+At minimum:
+
+* `avg_entry_price` (position)
+* `executed_sell_qty` (from fills)
+* `total_quote_received` (from fills)
+* fee breakdown (from fills)
+
+### Suggested Formula (Quote Currency)
+
+```text
+proceeds_quote = total_quote_received
+cost_quote = executed_sell_qty × avg_entry_price
+realized_pnl_quote = proceeds_quote − cost_quote − quote_fees
+```
+
+Fee handling:
+
+* if fee asset is quote (e.g., USDT): subtract directly
+* if fee asset is base: reflect via net quantities (position qty is net-of-fee)
+* if fee asset is neither base nor quote: record warning + store separately (do not silently convert in MVP)
+
+## 7.X.5 Fee Asset Is Exchange-Determined
+
+Execution must treat `fills[].commissionAsset` as the source of truth.
+
+Rule:
+
+* do not assume fee asset is base
+* do not assume fee asset is quote
+* do not assume BNB-fee mode is available on all environments (e.g., Spot Testnet may not expose SAPI toggles)
+
+Persist commission breakdown for auditability.
+
+## 7.X.6 Dust Policy (Post-SELL Remainders)
+
+After a SELL fill, position remainder may be below `minQty` due to:
+
+* stepSize rounding
+* base-asset fees
+
+Rule:
+
+* if remaining quantity is `0` → close position
+* if remaining quantity is below `minQty` → treat as dust and close position as dust
+
+Dust must not block subsequent trades indefinitely.
+
+## 7.X.7 Dust Ledger Integration (Accounting Only)
+
+When a position is closed due to dust, the leftover dust quantity must be tracked for future realized PnL accounting.
+
+### New Table (Recommended)
+
+```text
+dust_ledger
+-----------
+dust_id
+asset
+dust_qty
+avg_cost_price
+needs_reconcile
+created_at_utc
+updated_at_utc
+```
+
+### What the Dust Ledger Represents
+
+* dust ledger tracks **unpositioned free dust only**
+* it is not the source of truth for tradable funds
+* Binance balances remain authoritative for tradable quantity
+
+### Deterministic Write (Immediate)
+
+On dust-close:
+
+* write dust quantity into `dust_ledger` immediately
+* set `needs_reconcile = 1`
+* compute `avg_cost_price` using weighted average cost
+
+### Reconciliation Rule (Next Balance Sync)
+
+Dust ledger must be reconciled against Binance balances on the next successful balance sync.
+
+Key clamp rule to prevent double-counting:
+
+```text
+max_unpositioned_free = max(0, binance_free_balance - open_position_qty_total)
+effective_dust = min(dust_ledger_qty, max_unpositioned_free)
+dust_ledger_qty = effective_dust
+```
+
+If a clamp occurs:
+
+* log a warning
+* keep `avg_cost_price` unchanged
+
+### Dust Trading
+
+Dust is not automatically traded.
+
+If accumulated dust becomes tradable (>= `minQty` and `minNotional`), the system may:
+
+* warn the user
+* provide a manual sweep command (later phase)
+
+## Reference Document
+
+This phase must follow:
+
+* `phases/locked_rules_sell_pnl_dust.md`
+
 # Phase 7.X — Execution Refinements (MVP Critical Additions)
 
 > This section **extends Phase 7** and adds execution-critical rules required for safe MVP implementation.  

@@ -249,6 +249,33 @@ class BinanceSpotClient(SpotExchangeClient):
             raise RuntimeError("Unexpected POST /api/v3/order response")
         return resp.data
 
+    def create_order_market_sell_qty(
+        self,
+        *,
+        symbol: str,
+        quantity: str,
+        client_order_id: str,
+    ) -> dict:
+        params: dict[str, str] = {
+            "symbol": symbol,
+            "side": "SELL",
+            "type": "MARKET",
+            "quantity": quantity,
+            "newClientOrderId": client_order_id,
+            "newOrderRespType": "FULL",
+        }
+        url = self._signed_url("/api/v3/order", params=params)
+        resp = request_json(
+            method="POST",
+            url=url,
+            headers=self._headers(signed=True),
+            timeout_s=self.timeout_s,
+            ssl_context=self._ssl_context(),
+        )
+        if not isinstance(resp.data, dict):
+            raise RuntimeError("Unexpected POST /api/v3/order response")
+        return resp.data
+
     def create_order_limit_buy(
         self,
         *,
@@ -261,6 +288,37 @@ class BinanceSpotClient(SpotExchangeClient):
         params: dict[str, str] = {
             "symbol": symbol,
             "side": "BUY",
+            "type": "LIMIT",
+            "timeInForce": time_in_force,
+            "price": price,
+            "quantity": quantity,
+            "newClientOrderId": client_order_id,
+            "newOrderRespType": "FULL",
+        }
+        url = self._signed_url("/api/v3/order", params=params)
+        resp = request_json(
+            method="POST",
+            url=url,
+            headers=self._headers(signed=True),
+            timeout_s=self.timeout_s,
+            ssl_context=self._ssl_context(),
+        )
+        if not isinstance(resp.data, dict):
+            raise RuntimeError("Unexpected POST /api/v3/order response")
+        return resp.data
+
+    def create_order_limit_sell(
+        self,
+        *,
+        symbol: str,
+        price: str,
+        quantity: str,
+        client_order_id: str,
+        time_in_force: str = "GTC",
+    ) -> dict:
+        params: dict[str, str] = {
+            "symbol": symbol,
+            "side": "SELL",
             "type": "LIMIT",
             "timeInForce": time_in_force,
             "price": price,
@@ -294,6 +352,20 @@ class BinanceSpotClient(SpotExchangeClient):
             raise RuntimeError("Unexpected GET /api/v3/order response")
         return resp.data
 
+    def get_order_by_order_id(self, *, symbol: str, order_id: str) -> dict:
+        params: dict[str, str] = {"symbol": symbol, "orderId": str(order_id)}
+        url = self._signed_url("/api/v3/order", params=params)
+        resp = request_json(
+            method="GET",
+            url=url,
+            headers=self._headers(signed=True),
+            timeout_s=self.timeout_s,
+            ssl_context=self._ssl_context(),
+        )
+        if not isinstance(resp.data, dict):
+            raise RuntimeError("Unexpected GET /api/v3/order response")
+        return resp.data
+
     def cancel_order_by_client_order_id(self, *, symbol: str, client_order_id: str) -> dict:
         params: dict[str, str] = {"symbol": symbol, "origClientOrderId": client_order_id}
         url = self._signed_url("/api/v3/order", params=params)
@@ -307,3 +379,49 @@ class BinanceSpotClient(SpotExchangeClient):
         if not isinstance(resp.data, dict):
             raise RuntimeError("Unexpected DELETE /api/v3/order response")
         return resp.data
+
+    def get_spot_bnb_burn(self) -> bool:
+        """
+        Returns whether "pay fees with BNB" (spotBNBBurn) is enabled.
+        Endpoint: GET /sapi/v1/bnbBurn (USER_DATA, signed)
+        """
+        url = self._signed_url("/sapi/v1/bnbBurn", params={})
+        resp = request_json(
+            method="GET",
+            url=url,
+            headers=self._headers(signed=True),
+            timeout_s=self.timeout_s,
+            ssl_context=self._ssl_context(),
+        )
+        if not isinstance(resp.data, dict):
+            raise RuntimeError("Unexpected GET /sapi/v1/bnbBurn response")
+        val = resp.data.get("spotBNBBurn")
+        if isinstance(val, bool):
+            return val
+        if isinstance(val, (int, float)):
+            return bool(val)
+        if isinstance(val, str):
+            return val.strip().lower() in ("1", "true", "yes", "y", "on")
+        raise RuntimeError("Unexpected GET /sapi/v1/bnbBurn payload (missing spotBNBBurn)")
+
+    def set_spot_bnb_burn(self, *, enabled: bool) -> bool:
+        """
+        Sets "pay fees with BNB" (spotBNBBurn).
+        Endpoint: POST /sapi/v1/bnbBurn (USER_DATA, signed)
+        """
+        params: dict[str, str] = {"spotBNBBurn": "true" if enabled else "false"}
+        url = self._signed_url("/sapi/v1/bnbBurn", params=params)
+        resp = request_json(
+            method="POST",
+            url=url,
+            headers=self._headers(signed=True),
+            timeout_s=self.timeout_s,
+            ssl_context=self._ssl_context(),
+        )
+        if not isinstance(resp.data, dict):
+            raise RuntimeError("Unexpected POST /sapi/v1/bnbBurn response")
+        # Response commonly includes booleans for spotBNBBurn/interestBNBBurn; treat as best-effort.
+        val = resp.data.get("spotBNBBurn")
+        if isinstance(val, bool):
+            return val
+        return enabled

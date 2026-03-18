@@ -32,6 +32,7 @@ CREATE TABLE IF NOT EXISTS balances (
 CREATE TABLE IF NOT EXISTS orders (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   exchange_order_id TEXT,
+  order_source TEXT NOT NULL DEFAULT 'external',
   symbol TEXT NOT NULL,
   side TEXT NOT NULL,
   type TEXT NOT NULL,
@@ -85,14 +86,33 @@ CREATE TABLE IF NOT EXISTS trade_requests (
 CREATE TABLE IF NOT EXISTS positions (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   symbol TEXT NOT NULL,
+  base_asset TEXT,
+  quote_asset TEXT,
+  market_data_environment TEXT NOT NULL,
+  execution_environment TEXT NOT NULL,
   entry_price TEXT NOT NULL,
   quantity TEXT NOT NULL,
+  source_execution_id INTEGER,
+  gross_quantity TEXT,
+  fee_amount TEXT,
+  fee_asset TEXT,
   stop_loss_price TEXT NOT NULL,
   profit_target_price TEXT NOT NULL,
   deadline_utc TEXT NOT NULL,
   status TEXT NOT NULL,
   opened_at_utc TEXT,
   closed_at_utc TEXT,
+  last_monitored_at_utc TEXT,
+  created_at_utc TEXT NOT NULL,
+  updated_at_utc TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS dust_ledger (
+  dust_id INTEGER PRIMARY KEY AUTOINCREMENT,
+  asset TEXT NOT NULL UNIQUE,
+  dust_qty TEXT NOT NULL,
+  avg_cost_price TEXT NOT NULL,
+  needs_reconcile INTEGER NOT NULL DEFAULT 1,
   created_at_utc TEXT NOT NULL,
   updated_at_utc TEXT NOT NULL
 );
@@ -179,6 +199,10 @@ CREATE TABLE IF NOT EXISTS executions (
   total_quote_spent TEXT,
   commission_total TEXT,
   commission_asset TEXT,
+  fee_breakdown_json TEXT,
+  realized_pnl_quote TEXT,
+  realized_pnl_quote_asset TEXT,
+  pnl_warnings_json TEXT,
   fills_count INTEGER,
   local_status TEXT NOT NULL,
   raw_status TEXT,
@@ -203,3 +227,173 @@ CREATE TABLE IF NOT EXISTS audit_logs (
   event TEXT NOT NULL,
   details_json TEXT
 );
+
+CREATE TABLE IF NOT EXISTS monitoring_events (
+  monitoring_event_id INTEGER PRIMARY KEY AUTOINCREMENT,
+  position_id INTEGER NOT NULL,
+  created_at_utc TEXT NOT NULL,
+  symbol TEXT NOT NULL,
+  entry_price TEXT,
+  current_price TEXT,
+  pnl_percent TEXT,
+  decision TEXT NOT NULL,
+  exit_reason TEXT,
+  deadline_utc TEXT,
+  position_status TEXT,
+  error_code TEXT,
+  error_message TEXT,
+  FOREIGN KEY(position_id) REFERENCES positions(id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_monitoring_events_position_id ON monitoring_events(position_id);
+
+CREATE TABLE IF NOT EXISTS manual_orders (
+  manual_order_id INTEGER PRIMARY KEY AUTOINCREMENT,
+  created_at_utc TEXT NOT NULL,
+  updated_at_utc TEXT NOT NULL,
+  dry_run INTEGER NOT NULL,
+  execution_environment TEXT NOT NULL,
+  base_url TEXT NOT NULL,
+  symbol TEXT NOT NULL,
+  side TEXT NOT NULL,
+  order_type TEXT NOT NULL,
+  time_in_force TEXT,
+  limit_price TEXT,
+  quote_order_qty TEXT,
+  quantity TEXT,
+  client_order_id TEXT NOT NULL,
+  binance_order_id TEXT,
+  local_status TEXT NOT NULL,
+  raw_status TEXT,
+  retry_count INTEGER NOT NULL,
+  executed_quantity TEXT,
+  avg_fill_price TEXT,
+  total_quote_value TEXT,
+  fee_breakdown_json TEXT,
+  message TEXT,
+  details_json TEXT
+);
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_manual_orders_client_order_id ON manual_orders(client_order_id);
+CREATE INDEX IF NOT EXISTS idx_manual_orders_created_at ON manual_orders(created_at_utc);
+
+-- Phase 12 — Manual Loop Trading Mode (human-only)
+CREATE TABLE IF NOT EXISTS loop_sessions (
+  loop_id INTEGER PRIMARY KEY AUTOINCREMENT,
+  created_at_utc TEXT NOT NULL,
+  updated_at_utc TEXT NOT NULL,
+  dry_run INTEGER NOT NULL DEFAULT 0,
+  status TEXT NOT NULL,
+  execution_environment TEXT NOT NULL,
+  base_url TEXT NOT NULL,
+  preset_id INTEGER,
+  symbol TEXT NOT NULL,
+  quote_qty TEXT NOT NULL,
+  entry_order_type TEXT NOT NULL,
+  entry_limit_price TEXT,
+  take_profit_kind TEXT NOT NULL,
+  take_profit_value TEXT NOT NULL,
+  rebuy_kind TEXT,
+  rebuy_value TEXT,
+  stop_loss_kind TEXT,
+  stop_loss_value TEXT,
+  stop_loss_action TEXT NOT NULL DEFAULT 'stop_only',
+  cleanup_policy TEXT NOT NULL DEFAULT 'cancel-open',
+  max_cycles INTEGER NOT NULL,
+  cycles_completed INTEGER NOT NULL DEFAULT 0,
+  state TEXT NOT NULL,
+  last_buy_leg_id INTEGER,
+  last_sell_leg_id INTEGER,
+  last_buy_avg_price TEXT,
+  last_sell_avg_price TEXT,
+  last_buy_executed_qty TEXT,
+  last_sell_executed_qty TEXT,
+  cumulative_realized_pnl_quote TEXT,
+  pnl_quote_asset TEXT,
+  stopped_at_utc TEXT,
+  last_error TEXT,
+  last_warning TEXT
+);
+
+CREATE INDEX IF NOT EXISTS idx_loop_sessions_status ON loop_sessions(status);
+CREATE INDEX IF NOT EXISTS idx_loop_sessions_symbol ON loop_sessions(symbol);
+CREATE INDEX IF NOT EXISTS idx_loop_sessions_preset_id ON loop_sessions(preset_id);
+
+CREATE TABLE IF NOT EXISTS loop_legs (
+  leg_id INTEGER PRIMARY KEY AUTOINCREMENT,
+  loop_id INTEGER NOT NULL,
+  created_at_utc TEXT NOT NULL,
+  updated_at_utc TEXT NOT NULL,
+  cycle_index INTEGER NOT NULL,
+  leg_role TEXT NOT NULL,
+  side TEXT NOT NULL,
+  order_type TEXT NOT NULL,
+  time_in_force TEXT,
+  limit_price TEXT,
+  quote_order_qty TEXT,
+  quantity TEXT,
+  client_order_id TEXT NOT NULL,
+  binance_order_id TEXT,
+  local_status TEXT NOT NULL,
+  raw_status TEXT,
+  retry_count INTEGER NOT NULL DEFAULT 0,
+  executed_quantity TEXT,
+  avg_fill_price TEXT,
+  total_quote_value TEXT,
+  fee_breakdown_json TEXT,
+  message TEXT,
+  submitted_at_utc TEXT,
+  reconciled_at_utc TEXT,
+  filled_at_utc TEXT,
+  FOREIGN KEY(loop_id) REFERENCES loop_sessions(loop_id)
+);
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_loop_legs_client_order_id ON loop_legs(client_order_id);
+CREATE INDEX IF NOT EXISTS idx_loop_legs_loop_id ON loop_legs(loop_id);
+CREATE INDEX IF NOT EXISTS idx_loop_legs_status ON loop_legs(local_status);
+CREATE INDEX IF NOT EXISTS idx_loop_legs_binance_order_id ON loop_legs(binance_order_id);
+
+CREATE TABLE IF NOT EXISTS loop_events (
+  loop_event_id INTEGER PRIMARY KEY AUTOINCREMENT,
+  loop_id INTEGER NOT NULL,
+  created_at_utc TEXT NOT NULL,
+  event_type TEXT NOT NULL,
+  preset_id INTEGER,
+  symbol TEXT,
+  side TEXT,
+  cycle_number INTEGER,
+  client_order_id TEXT,
+  binance_order_id TEXT,
+  price TEXT,
+  quantity TEXT,
+  message TEXT,
+  details_json TEXT,
+  FOREIGN KEY(loop_id) REFERENCES loop_sessions(loop_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_loop_events_loop_id ON loop_events(loop_id);
+CREATE INDEX IF NOT EXISTS idx_loop_events_event_type ON loop_events(event_type);
+CREATE INDEX IF NOT EXISTS idx_loop_events_preset_id ON loop_events(preset_id);
+
+-- Phase 12 — Manual Loop Trading presets (saved configurations)
+CREATE TABLE IF NOT EXISTS loop_presets (
+  preset_id INTEGER PRIMARY KEY AUTOINCREMENT,
+  created_at_utc TEXT NOT NULL,
+  updated_at_utc TEXT NOT NULL,
+  name TEXT,
+  notes TEXT,
+  symbol TEXT NOT NULL,
+  quote_qty TEXT NOT NULL,
+  entry_order_type TEXT NOT NULL,
+  entry_limit_price TEXT,
+  take_profit_kind TEXT NOT NULL,
+  take_profit_value TEXT NOT NULL,
+  rebuy_kind TEXT,
+  rebuy_value TEXT,
+  stop_loss_kind TEXT,
+  stop_loss_value TEXT,
+  stop_loss_action TEXT NOT NULL DEFAULT 'stop_only',
+  cleanup_policy TEXT NOT NULL DEFAULT 'cancel-open'
+);
+
+CREATE INDEX IF NOT EXISTS idx_loop_presets_symbol ON loop_presets(symbol);

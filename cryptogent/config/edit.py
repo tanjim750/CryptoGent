@@ -12,6 +12,8 @@ class BinanceCredentialUpdate:
     testnet: bool | None = None
     testnet_api_key: str | None = None
     testnet_api_secret: str | None = None
+    spot_bnb_burn: bool | str | None = None
+    testnet_spot_bnb_burn: bool | str | None = None
 
 
 def _is_section(line: str) -> bool:
@@ -82,6 +84,11 @@ def _toml_str(value: str) -> str:
 def _toml_bool(value: bool) -> str:
     return "true" if value else "false"
 
+def _toml_value(value: bool | str) -> str:
+    if isinstance(value, bool):
+        return _toml_bool(value)
+    return _toml_str(value)
+
 
 def update_binance_config(config_path: Path, update: BinanceCredentialUpdate) -> None:
     config_path = config_path.expanduser()
@@ -101,6 +108,12 @@ def update_binance_config(config_path: Path, update: BinanceCredentialUpdate) ->
     if update.testnet_api_secret is not None:
         lines = _set_kv_in_section(
             lines, section="binance_testnet", key="api_secret", value_repr=_toml_str(update.testnet_api_secret)
+        )
+    if update.spot_bnb_burn is not None:
+        lines = _set_kv_in_section(lines, section="binance", key="spot_bnb_burn", value_repr=_toml_value(update.spot_bnb_burn))
+    if update.testnet_spot_bnb_burn is not None:
+        lines = _set_kv_in_section(
+            lines, section="binance_testnet", key="spot_bnb_burn", value_repr=_toml_value(update.testnet_spot_bnb_burn)
         )
 
     # Always end with a newline.

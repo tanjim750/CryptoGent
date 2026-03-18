@@ -71,6 +71,10 @@ def sync_balances(*, client: BinanceSpotClient, conn: sqlite3.Connection) -> Syn
         balances = client.get_balances()
         state.save_account_snapshot(payload={"kind": "account", "account": account})
         state.upsert_balances(balances)
+        try:
+            state.reconcile_dust_ledger(balances=balances)
+        except Exception:
+            pass
         state.append_audit(level="INFO", event="sync_balances_ok", details={"count": len(balances)})
         state.record_sync_run_finish(sync_run_id=sync_id, status="ok", error_msg=None)
         return SyncResult(kind="balances", status="ok", balances_upserted=len(balances))
@@ -105,6 +109,10 @@ def startup_sync(*, client: BinanceSpotClient, conn: sqlite3.Connection) -> Sync
         open_orders = client.get_open_orders()
         state.save_account_snapshot(payload={"kind": "startup", "account": account, "open_orders": open_orders})
         state.upsert_balances(balances)
+        try:
+            state.reconcile_dust_ledger(balances=balances)
+        except Exception:
+            pass
         state.sync_open_orders(_orders_from_open_orders(open_orders), symbol=None)
         state.append_audit(
             level="INFO",
