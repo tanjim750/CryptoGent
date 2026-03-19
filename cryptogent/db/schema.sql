@@ -11,6 +11,10 @@ CREATE TABLE IF NOT EXISTS system_state (
   last_shutdown_time_utc TEXT,
   last_successful_sync_time_utc TEXT,
   current_mode TEXT,
+  automation_paused INTEGER NOT NULL DEFAULT 0,
+  pause_reason TEXT,
+  paused_at_utc TEXT,
+  last_reconciliation_status TEXT,
   created_at_utc TEXT NOT NULL,
   updated_at_utc TEXT NOT NULL
 );
@@ -246,6 +250,30 @@ CREATE TABLE IF NOT EXISTS monitoring_events (
 );
 
 CREATE INDEX IF NOT EXISTS idx_monitoring_events_position_id ON monitoring_events(position_id);
+
+CREATE TABLE IF NOT EXISTS reconciliation_events (
+  reconciliation_event_id INTEGER PRIMARY KEY AUTOINCREMENT,
+  event_type TEXT NOT NULL,
+  status TEXT NOT NULL,
+  summary TEXT NOT NULL,
+  details_json TEXT,
+  created_at_utc TEXT NOT NULL,
+  updated_at_utc TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_reconciliation_events_created ON reconciliation_events(created_at_utc);
+
+CREATE TABLE IF NOT EXISTS automation_pauses (
+  pause_id INTEGER PRIMARY KEY AUTOINCREMENT,
+  scope_type TEXT NOT NULL, -- loop|symbol
+  scope_key TEXT NOT NULL,
+  status TEXT NOT NULL, -- active|cleared
+  reason TEXT,
+  created_at_utc TEXT NOT NULL,
+  updated_at_utc TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_automation_pauses_scope ON automation_pauses(scope_type, scope_key, status);
 
 CREATE TABLE IF NOT EXISTS manual_orders (
   manual_order_id INTEGER PRIMARY KEY AUTOINCREMENT,

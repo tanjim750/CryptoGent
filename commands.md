@@ -265,6 +265,35 @@ All loop commands that can submit/cancel require `--i-am-human`. Use `--dry-run`
 - `cryptogent monitor events list [--limit N]`  
   List monitoring event history (includes decision + reason code).
 
+## Orders (Open Orders Management)
+
+- `cryptogent orders cancel <order_id> [--i-am-human]`  
+  Cancel a cached **open non‑MARKET** order by Binance `order_id` for sources `manual` or `execution`.
+  External orders (`src=external`) cannot be cancelled.
+  Manual orders require `--i-am-human`.
+
+## Reliability (Phase 9)
+
+- `cryptogent reliability status`  
+  Show pause state, last reconciliation status, and last successful sync.
+
+- `cryptogent reliability reconcile`  
+  Sync balances + open orders, detect mismatches (balances, unknown orders, missing orders, position mismatch, uncertain executions), and record reconciliation events.  
+  If critical ambiguity is detected, **global automation** is paused.  
+  Single‑symbol mismatches pause only that symbol (and related loops).
+
+- `cryptogent reliability resume --global --i-am-human`  
+  Resume global automation after a healthy reconciliation.
+
+- `cryptogent reliability resume --symbol SOLUSDT --i-am-human`  
+  Resume automation for a paused symbol after a healthy reconciliation.
+
+- `cryptogent reliability resume --loop-id 12 --i-am-human`  
+  Resume automation for a paused loop after a healthy reconciliation.
+
+- `cryptogent reliability events list [--limit N]`  
+  List recent reconciliation events.
+
 ## PnL Helpers
 
 - `cryptogent pnl realized [--limit N]`  

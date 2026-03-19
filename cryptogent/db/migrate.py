@@ -5,7 +5,7 @@ from pathlib import Path
 from cryptogent.config.io import DEFAULT_DB_PATH, load_config
 from cryptogent.db.connection import connect
 
-TARGET_SCHEMA_VERSION = 25
+TARGET_SCHEMA_VERSION = 27
 
 
 def _read_schema_sql() -> str:
@@ -394,6 +394,48 @@ def _migrate_to_v25(conn) -> None:
     # Manual loop order cleanup policy (default cancel-open).
     _add_column_if_missing(conn, "loop_presets", "cleanup_policy", "cleanup_policy TEXT NOT NULL DEFAULT 'cancel-open'")
     _add_column_if_missing(conn, "loop_sessions", "cleanup_policy", "cleanup_policy TEXT NOT NULL DEFAULT 'cancel-open'")
+
+
+def _migrate_to_v26(conn) -> None:
+    # Reliability fields on system_state.
+    _add_column_if_missing(conn, "system_state", "automation_paused", "automation_paused INTEGER NOT NULL DEFAULT 0")
+    _add_column_if_missing(conn, "system_state", "pause_reason", "pause_reason TEXT")
+    _add_column_if_missing(conn, "system_state", "paused_at_utc", "paused_at_utc TEXT")
+    _add_column_if_missing(conn, "system_state", "last_reconciliation_status", "last_reconciliation_status TEXT")
+
+    # Reconciliation events table.
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS reconciliation_events (
+          reconciliation_event_id INTEGER PRIMARY KEY AUTOINCREMENT,
+          event_type TEXT NOT NULL,
+          status TEXT NOT NULL,
+          summary TEXT NOT NULL,
+          details_json TEXT,
+          created_at_utc TEXT NOT NULL,
+          updated_at_utc TEXT NOT NULL
+        )
+        """
+    )
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_reconciliation_events_created ON reconciliation_events(created_at_utc)")
+
+
+def _migrate_to_v27(conn) -> None:
+    # Scoped automation pauses (loop/symbol).
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS automation_pauses (
+          pause_id INTEGER PRIMARY KEY AUTOINCREMENT,
+          scope_type TEXT NOT NULL,
+          scope_key TEXT NOT NULL,
+          status TEXT NOT NULL,
+          reason TEXT,
+          created_at_utc TEXT NOT NULL,
+          updated_at_utc TEXT NOT NULL
+        )
+        """
+    )
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_automation_pauses_scope ON automation_pauses(scope_type, scope_key, status)")
 
 
 def _migrate_to_v7(conn) -> None:
@@ -802,6 +844,10 @@ def ensure_db_initialized(*, config_path: Path, db_path: Path | None) -> Path:
             _migrate_to_v24(conn)
         if current < 25:
             _migrate_to_v25(conn)
+        if current < 26:
+            _migrate_to_v26(conn)
+        if current < 27:
+            _migrate_to_v27(conn)
         conn.execute(
             "INSERT OR REPLACE INTO app_meta(key, value) VALUES(?, ?)",
             ("schema_version", str(TARGET_SCHEMA_VERSION)),

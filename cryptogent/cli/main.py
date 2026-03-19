@@ -2906,6 +2906,29 @@ def _monitor_once_core(args: argparse.Namespace) -> tuple[int, int, int, int, li
             symbol = str(pos.get("symbol") or "").strip().upper()
             md_env = str(pos.get("market_data_environment") or "mainnet_public")
 
+            # Skip monitoring for paused symbols.
+            try:
+                if state.is_symbol_paused(symbol=symbol):
+                    paused += 1
+                    if verbose:
+                        print(f"pos_id={pos_id} symbol={symbol} decision=data_unavailable reason=symbol_paused")
+                    state.create_monitoring_event(
+                        position_id=pos_id,
+                        symbol=symbol,
+                        entry_price=str(pos.get("entry_price") or "") or None,
+                        current_price=None,
+                        pnl_percent=None,
+                        decision="data_unavailable",
+                        exit_reason="symbol_paused",
+                        deadline_utc=str(pos.get("deadline_utc") or "") or None,
+                        position_status=str(pos.get("status") or ""),
+                        error_code="symbol_paused",
+                        error_message="symbol paused by reliability policy",
+                    )
+                    continue
+            except Exception:
+                pass
+
             try:
                 client = _price_client_for_market_env(
                     cfg=cfg,
@@ -3103,6 +3126,14 @@ def cmd_monitor_loop(args: argparse.Namespace) -> int:
     consecutive_failures = 0
     try:
         while True:
+            try:
+                with connect(ensure_db_initialized(config_path=config_path, db_path=paths.db_path)) as conn:
+                    sys_state = StateManager(conn).get_system_state() or {}
+                    if bool(sys_state.get("automation_paused") or 0):
+                        print("Monitoring paused (global automation_paused=true).")
+                        return 0
+            except Exception:
+                pass
             if end_at is not None and time.monotonic() >= end_at:
                 break
             checked, exit_recommended, reevaluate, paused, checked_positions, failed_positions = _monitor_once_core(args)
@@ -3214,6 +3245,288 @@ def cmd_monitor_events_list(args: argparse.Namespace) -> int:
             f"{str(r.get('pnl_percent') or '-'): <10} "
             f"{str(r.get('created_at_utc') or '-'): <20}"
         )
+    return 0
+
+
+def cmd_reliability_status(args: argparse.Namespace) -> int:
+    paths = ConfigPaths.from_cli(config_path=args.config, db_path=args.db)
+    config_path = ensure_default_config(paths.config_path)
+    db_path = ensure_db_initialized(config_path=config_path, db_path=paths.db_path)
+    with connect(db_path) as conn:
+        state = StateManager(conn)
+        s = state.get_system_state()
+    if not s:
+        print("(no system state)")
+        return 2
+    pauses = []
+    try:
+        with connect(db_path) as conn:
+            pauses = StateManager(conn).list_active_pauses()
+    except Exception:
+        pauses = []
+    print("Reliability Status")
+    print(f"- automation_paused: {bool(s.get('automation_paused') or 0)}")
+    print(f"- pause_reason: {s.get('pause_reason')}")
+    print(f"- paused_at_utc: {s.get('paused_at_utc')}")
+    print(f"- last_reconciliation_status: {s.get('last_reconciliation_status')}")
+    print(f"- last_successful_sync_time_utc: {s.get('last_successful_sync_time_utc')}")
+    if pauses:
+        loop_n = len([p for p in pauses if p.get("scope_type") == "loop"])
+        sym_n = len([p for p in pauses if p.get("scope_type") == "symbol"])
+        print(f"- scoped_pauses: loop={loop_n} symbol={sym_n}")
+    return 0
+
+
+def cmd_reliability_events_list(args: argparse.Namespace) -> int:
+    paths = ConfigPaths.from_cli(config_path=args.config, db_path=args.db)
+    config_path = ensure_default_config(paths.config_path)
+    db_path = ensure_db_initialized(config_path=config_path, db_path=paths.db_path)
+    limit = int(getattr(args, "limit", 50))
+    with connect(db_path) as conn:
+        rows = StateManager(conn).list_reconciliation_events(limit=limit)
+    if not rows:
+        print("(no reconciliation events)")
+        return 0
+    print(f"Reconciliation events: {len(rows)}")
+    print(f"{'EVT_ID':>6} {'TYPE':<20} {'STATUS':<24} {'AT_UTC':<20} SUMMARY")
+    for r in rows:
+        summary = str(r.get("summary") or "")
+        if len(summary) > 80:
+            summary = summary[:77] + "..."
+        print(
+            f"{int(r.get('reconciliation_event_id') or 0):>6} "
+            f"{str(r.get('event_type') or '-'): <20} "
+            f"{str(r.get('status') or '-'): <24} "
+            f"{str(r.get('created_at_utc') or '-'): <20} "
+            f"{summary}"
+        )
+    return 0
+
+
+def cmd_reliability_reconcile(args: argparse.Namespace) -> int:
+    client = _client_from_args(args)
+    paths = ConfigPaths.from_cli(config_path=args.config, db_path=args.db)
+    config_path = ensure_default_config(paths.config_path)
+    db_path = ensure_db_initialized(config_path=config_path, db_path=paths.db_path)
+
+    def _dec(v: object) -> Decimal:
+        try:
+            return Decimal(str(v))
+        except Exception:
+            return Decimal("0")
+
+    with connect(db_path) as conn:
+        state = StateManager(conn)
+        balances_before = {str(r.get("asset") or "").upper(): r for r in state.list_balances(include_zero=True)}
+        open_before = state.list_open_orders()
+        open_before_ids = {str(o.get("exchange_order_id") or "") for o in open_before if o.get("exchange_order_id")}
+        positions = state.list_positions(status="OPEN", limit=200)
+
+    # Sync from exchange (source of truth).
+    with connect(db_path) as conn:
+        sync_balances(client=client, conn=conn)
+        sync_open_orders(client=client, conn=conn, symbol=None)
+
+    events = 0
+    warnings = 0
+    critical = 0
+    critical_symbols: set[str] = set()
+    paused_loops: set[int] = set()
+
+    with connect(db_path) as conn:
+        state = StateManager(conn)
+        balances_after = {str(r.get("asset") or "").upper(): r for r in state.list_balances(include_zero=True)}
+        open_after = state.list_open_orders()
+        open_after_ids = {str(o.get("exchange_order_id") or "") for o in open_after if o.get("exchange_order_id")}
+
+        # Balance mismatches (warning only unless critical rules below trigger pause).
+        for asset in sorted(set(balances_before.keys()) | set(balances_after.keys())):
+            b = balances_before.get(asset, {})
+            a = balances_after.get(asset, {})
+            before_total = _dec(b.get("free")) + _dec(b.get("locked"))
+            after_total = _dec(a.get("free")) + _dec(a.get("locked"))
+            if before_total != after_total:
+                events += 1
+                warnings += 1
+                state.create_reconciliation_event(
+                    event_type="balance_mismatch",
+                    status="warning",
+                    summary=f"{asset} {before_total} -> {after_total}",
+                    details={"asset": asset, "before": str(before_total), "after": str(after_total)},
+                )
+
+        # Unknown open orders (external) - warning only.
+        for o in open_after:
+            if str(o.get("order_source") or "") == "external":
+                events += 1
+                warnings += 1
+                state.create_reconciliation_event(
+                    event_type="unknown_order",
+                    status="warning",
+                    summary=f"external open order {o.get('exchange_order_id')} {o.get('symbol')}",
+                    details={"order_id": o.get("exchange_order_id"), "symbol": o.get("symbol"), "source": "external"},
+                )
+
+        # Missing expected orders (were open, now not open) - warning.
+        for o in open_before:
+            oid = str(o.get("exchange_order_id") or "")
+            if not oid:
+                continue
+            src = str(o.get("order_source") or "")
+            if src not in ("manual", "execution"):
+                continue
+            if oid not in open_after_ids:
+                events += 1
+                warnings += 1
+                state.create_reconciliation_event(
+                    event_type="missing_order",
+                    status="warning",
+                    summary=f"{src} order disappeared {oid} {o.get('symbol')}",
+                    details={"order_id": oid, "symbol": o.get("symbol"), "source": src},
+                )
+                # If this is a loop-managed manual order, pause that loop only.
+                if src == "manual":
+                    try:
+                        leg = conn.execute(
+                            "SELECT loop_id FROM loop_legs WHERE binance_order_id = ? LIMIT 1",
+                            (oid,),
+                        ).fetchone()
+                        if leg and leg[0]:
+                            paused_loops.add(int(leg[0]))
+                    except Exception:
+                        pass
+
+        # Position mismatch vs balances
+        for p in positions:
+            base_asset = str(p.get("base_asset") or "")
+            if not base_asset:
+                continue
+            qty = _dec(p.get("quantity"))
+            b = balances_after.get(base_asset, {})
+            bal = _dec(b.get("free")) + _dec(b.get("locked"))
+            if bal + Decimal("0.00000001") < qty:
+                events += 1
+                critical += 1
+                critical_symbols.add(str(p.get("symbol") or "").upper())
+                state.create_reconciliation_event(
+                    event_type="position_mismatch",
+                    status="manual_intervention_required",
+                    summary=f"{p.get('symbol')} qty {qty} > balance {bal}",
+                    details={"position_id": p.get("id"), "symbol": p.get("symbol"), "qty": str(qty), "balance": str(bal)},
+                )
+                state.close_position_external(position_id=int(p.get("id") or 0), reason="position_mismatch")
+
+        # Uncertain executions
+        cur = conn.execute(
+            "SELECT COUNT(*) AS n FROM executions WHERE local_status IN ('uncertain_submitted','retry_submitted','submitting')"
+        )
+        n_uncertain = int(cur.fetchone()["n"])
+        if n_uncertain > 0:
+            events += 1
+            critical += 1
+            state.create_reconciliation_event(
+                event_type="uncertain_execution_recovery",
+                status="manual_intervention_required",
+                summary=f"{n_uncertain} uncertain executions need reconcile",
+                details={"count": n_uncertain},
+            )
+
+        # Determine overall status
+        if events == 0:
+            status = "no_change"
+        elif critical > 0:
+            status = "manual_intervention_required"
+        else:
+            status = "reconciled_with_warning"
+
+        state.update_reconciliation_status(status=status)
+
+        # Apply pause policy:
+        # - Global pause only for critical execution mismatch / uncertain state.
+        # - Scoped pauses for loop/symbol mismatches.
+        if n_uncertain > 0:
+            state.set_automation_paused(paused=True, reason="execution_uncertain", status=status)
+        elif len(critical_symbols) > 1:
+            state.set_automation_paused(paused=True, reason="multiple_position_mismatch", status=status)
+
+        # Scoped pauses (loop_id / symbol).
+        for loop_id in paused_loops:
+            state.set_pause(scope_type="loop", scope_key=str(loop_id), reason="missing_order")
+        for sym in critical_symbols:
+            state.set_pause(scope_type="symbol", scope_key=sym, reason="position_mismatch")
+
+        # Auto-resume scoped pauses on healthy reconciliation.
+        if status in ("no_change", "reconciled_with_warning"):
+            state.clear_all_scoped_pauses()
+
+    print("Reconciliation Summary")
+    print(f"- Status: {status}")
+    print(f"- Events: {events}")
+    print(f"- Warnings: {warnings}")
+    print(f"- Critical: {critical}")
+    if status == "manual_intervention_required":
+        print("- Action: automation paused")
+    return 0
+
+
+def cmd_reliability_resume(args: argparse.Namespace) -> int:
+    if not getattr(args, "i_am_human", False):
+        print("Missing required flag: --i-am-human")
+        return 2
+    paths = ConfigPaths.from_cli(config_path=args.config, db_path=args.db)
+    config_path = ensure_default_config(paths.config_path)
+    db_path = ensure_db_initialized(config_path=config_path, db_path=paths.db_path)
+    scope_global = bool(getattr(args, "global_pause", False))
+    scope_symbol = getattr(args, "symbol", None)
+    scope_loop = getattr(args, "loop_id", None)
+
+    if not (scope_global or scope_symbol or scope_loop):
+        print("Specify one of --global, --symbol, or --loop-id")
+        return 2
+
+    with connect(db_path) as conn:
+        state = StateManager(conn)
+        sys_state = state.get_system_state() or {}
+        status = str(sys_state.get("last_reconciliation_status") or "")
+        if status in ("manual_intervention_required", ""):
+            print("Rejected: system not healthy. Run `cryptogent reliability reconcile` first.")
+            return 2
+
+        if scope_global:
+            state.set_automation_paused(paused=False, reason=None, status=status)
+            state.create_reconciliation_event(
+                event_type="resume",
+                status="ok",
+                summary="global automation resumed",
+                details={"scope": "global"},
+            )
+            print("Automation resumed (global).")
+            return 0
+
+        if scope_symbol:
+            sym = str(scope_symbol).strip().upper()
+            state.clear_pause(scope_type="symbol", scope_key=sym)
+            state.create_reconciliation_event(
+                event_type="resume",
+                status="ok",
+                summary=f"symbol automation resumed {sym}",
+                details={"scope": "symbol", "symbol": sym},
+            )
+            print(f"Automation resumed for symbol {sym}.")
+            return 0
+
+        if scope_loop:
+            lid = int(scope_loop)
+            state.clear_pause(scope_type="loop", scope_key=str(lid))
+            state.create_reconciliation_event(
+                event_type="resume",
+                status="ok",
+                summary=f"loop automation resumed {lid}",
+                details={"scope": "loop", "loop_id": lid},
+            )
+            print(f"Automation resumed for loop {lid}.")
+            return 0
+
     return 0
 
 
@@ -4016,6 +4329,167 @@ def cmd_trade_manual_cancel(args: argparse.Namespace) -> int:
             pass
 
     print("Cancelled (requested)")
+    return 0
+
+
+def cmd_orders_cancel(args: argparse.Namespace) -> int:
+    """
+    Cancel an open order by exchange order id (manual/execution only).
+    External orders are never cancelled.
+    """
+    client = _client_from_args(args)
+    paths = ConfigPaths.from_cli(config_path=args.config, db_path=args.db)
+    config_path = ensure_default_config(paths.config_path)
+    db_path = ensure_db_initialized(config_path=config_path, db_path=paths.db_path)
+    order_id = str(getattr(args, "order_id", "") or "").strip()
+    if not order_id:
+        print("Missing --order-id")
+        return 2
+
+    with connect(db_path) as conn:
+        state = StateManager(conn)
+        row = conn.execute(
+            """
+            SELECT exchange_order_id, order_source, symbol, type, status
+            FROM orders
+            WHERE exchange_order_id = ?
+            ORDER BY updated_at_utc DESC
+            LIMIT 1
+            """,
+            (order_id,),
+        ).fetchone()
+        if not row:
+            print("(order not found)")
+            return 2
+        row = dict(row)
+        order_source = str(row.get("order_source") or "external")
+        status = str(row.get("status") or "")
+        symbol = str(row.get("symbol") or "").strip().upper()
+        order_type = str(row.get("type") or "").strip().upper()
+
+        if status not in ("NEW", "PARTIALLY_FILLED"):
+            print(f"Not cancellable (status={status})")
+            return 2
+        if order_source == "external":
+            print("Rejected: external orders cannot be cancelled by CryptoGent")
+            return 2
+        if order_source == "manual" and not getattr(args, "i_am_human", False):
+            print("Missing required flag: --i-am-human (manual orders only)")
+            return 2
+        if order_type == "MARKET":
+            print("Rejected: MARKET orders cannot be cancelled")
+            return 2
+        if not symbol:
+            print("Missing symbol for order")
+            return 2
+
+        # Locate client_order_id from manual/execution records.
+        client_order_id = None
+        manual_row = None
+        loop_leg = None
+        exec_row = None
+        if order_source == "manual":
+            manual_row = conn.execute(
+                "SELECT * FROM manual_orders WHERE binance_order_id = ? ORDER BY updated_at_utc DESC LIMIT 1",
+                (order_id,),
+            ).fetchone()
+            if manual_row:
+                manual_row = dict(manual_row)
+                client_order_id = str(manual_row.get("client_order_id") or "").strip() or None
+            if not client_order_id:
+                loop_leg = conn.execute(
+                    "SELECT * FROM loop_legs WHERE binance_order_id = ? ORDER BY updated_at_utc DESC LIMIT 1",
+                    (order_id,),
+                ).fetchone()
+                if loop_leg:
+                    loop_leg = dict(loop_leg)
+                    client_order_id = str(loop_leg.get("client_order_id") or "").strip() or None
+        elif order_source == "execution":
+            exec_row = state.get_execution_by_binance_order_id(binance_order_id=order_id)
+            if exec_row:
+                client_order_id = str(exec_row.get("client_order_id") or "").strip() or None
+
+        if not client_order_id:
+            print("Missing client_order_id for this open order")
+            return 2
+
+        if order_source == "manual":
+            print("Cancel Manual Order Preview")
+            print(f"- Order id: {order_id}")
+            print(f"- Symbol: {symbol}")
+            print(f"- Type: {order_type}")
+            print(f"- Client order id: {client_order_id}")
+            if not _prompt_yes_no("Cancel on exchange now?", default=False):
+                print("No changes made.")
+                return 2
+
+        try:
+            client.cancel_order_by_client_order_id(symbol=symbol, client_order_id=client_order_id)
+        except BinanceAPIError as e:
+            print(f"ERROR: {e}")
+            return 2
+
+        # Reconcile to update local rows.
+        try:
+            order = client.get_order_by_client_order_id(symbol=symbol, client_order_id=client_order_id)
+        except Exception:
+            order = None
+
+        if order is not None:
+            raw_status = str(order.get("status") or "") or None
+            # Update manual order / loop leg / execution based on source.
+            if manual_row:
+                _manual_finalize_from_order(state=state, manual_order_id=int(manual_row.get("manual_order_id") or 0), order=order, retry_count=int(manual_row.get("retry_count") or 0))
+            if loop_leg:
+                _loop_finalize_leg_from_order(state=state, leg_id=int(loop_leg.get("leg_id") or 0), order=order, retry_count=int(loop_leg.get("retry_count") or 0))
+            if exec_row:
+                from cryptogent.execution.result_parser import parse_fills
+
+                fills = None
+                try:
+                    fills = parse_fills(order)
+                except Exception:
+                    fills = None
+                local_status = "submitted"
+                if raw_status in ("NEW",):
+                    local_status = "open"
+                elif raw_status == "FILLED":
+                    local_status = "filled"
+                elif raw_status == "PARTIALLY_FILLED":
+                    local_status = "partially_filled"
+                elif raw_status in ("CANCELED", "CANCELLED"):
+                    local_status = "cancelled"
+                elif raw_status in ("EXPIRED",):
+                    local_status = "expired"
+                state.update_execution(
+                    execution_id=int(exec_row.get("execution_id") or 0),
+                    local_status=local_status,
+                    raw_status=raw_status,
+                    binance_order_id=str(order.get("orderId") or "") or None,
+                    executed_quantity=str(fills.executed_qty) if fills else None,
+                    avg_fill_price=str(fills.avg_fill_price) if fills and fills.avg_fill_price is not None else None,
+                    total_quote_spent=str(fills.total_quote_spent) if fills else None,
+                    commission_total=str(fills.commission_total) if fills and fills.commission_total is not None else None,
+                    commission_asset=(fills.commission_asset if fills else None),
+                    fills_count=(fills.fills_count if fills else None),
+                    retry_count=int(exec_row.get("retry_count") or 0),
+                    message="cancel_requested",
+                    details_json=None,
+                    submitted_at_utc=str(exec_row.get("submitted_at_utc") or "") or None,
+                    reconciled_at_utc=utcnow_iso(),
+                )
+
+        # Best-effort sync to refresh open orders/balances.
+        try:
+            sync_open_orders(client=client, conn=conn, symbol=symbol)
+        except Exception:
+            pass
+        try:
+            sync_balances(client=client, conn=conn)
+        except Exception:
+            pass
+
+    print("Cancel requested on exchange.")
     return 0
 
 
@@ -5663,6 +6137,17 @@ def cmd_trade_manual_loop_reconcile(args: argparse.Namespace) -> int:
             return (0, 0, 0, 0)
         if str(loop.get("execution_environment") or "").strip().lower() != env:
             raise ValueError(f"environment mismatch loop={loop.get('execution_environment')} runtime={env}")
+        # Global pause or loop-level pause halts loop runner.
+        try:
+            sys_state = state.get_system_state() or {}
+            if bool(sys_state.get("automation_paused") or 0):
+                state.append_loop_event(loop_id=loop_id, event_type="loop_paused", details={"reason": "global_pause"})
+                return (loop_id, 0, 1, 0)
+            if state.is_loop_paused(loop_id=loop_id):
+                state.append_loop_event(loop_id=loop_id, event_type="loop_paused", details={"reason": "loop_pause"})
+                return (loop_id, 0, 1, 0)
+        except Exception:
+            pass
         if str(loop.get("status") or "") not in ("running",):
             return (loop_id, 0, 0, 0)
 
@@ -6274,7 +6759,7 @@ def cmd_trade_manual_loop_reconcile(args: argparse.Namespace) -> int:
             sys.stdout.write("\r\x1b[2K" + base_line)
             sys.stdout.flush()
             if stopped:
-                print("\nStopped (loop not running)")
+                print("\nStopped (loop paused or not running)")
                 return 0
             stop_req = _sleep_with_ctrl_b(seconds=float(interval), end_at=end_at, base_line=base_line, show_countdown=True)
             if stop_req:
@@ -6501,6 +6986,47 @@ def build_parser() -> argparse.ArgumentParser:
     _add_common_paths(p_mon_events_list)
     p_mon_events_list.add_argument("--limit", type=int, default=50, help="Limit rows (default: 50).")
     p_mon_events_list.set_defaults(fn=cmd_monitor_events_list)
+
+    p_orders = sub.add_parser("orders", help="Manage cached open orders (manual/execution only).")
+    _add_common_paths(p_orders)
+    orders_sub = p_orders.add_subparsers(dest="orders_cmd", required=True)
+
+    p_orders_cancel = orders_sub.add_parser("cancel", help="Cancel an open order by exchange order id.")
+    _add_common_paths(p_orders_cancel)
+    _add_exchange_tls_args(p_orders_cancel)
+    p_orders_cancel.add_argument("order_id", help="Binance exchange order id.")
+    p_orders_cancel.add_argument("--i-am-human", action="store_true", help="Required for manual orders.")
+    p_orders_cancel.set_defaults(fn=cmd_orders_cancel)
+
+    p_rel = sub.add_parser("reliability", help="Phase 9 reliability and recovery tools.")
+    _add_common_paths(p_rel)
+    rel_sub = p_rel.add_subparsers(dest="rel_cmd", required=True)
+
+    p_rel_status = rel_sub.add_parser("status", help="Show reliability pause/recovery status.")
+    _add_common_paths(p_rel_status)
+    p_rel_status.set_defaults(fn=cmd_reliability_status)
+
+    p_rel_reconcile = rel_sub.add_parser("reconcile", help="Reconcile local state with exchange truth.")
+    _add_common_paths(p_rel_reconcile)
+    _add_exchange_tls_args(p_rel_reconcile)
+    p_rel_reconcile.set_defaults(fn=cmd_reliability_reconcile)
+
+    p_rel_events = rel_sub.add_parser("events", help="Reliability event history.")
+    _add_common_paths(p_rel_events)
+    rel_events_sub = p_rel_events.add_subparsers(dest="rel_events_cmd", required=True)
+
+    p_rel_events_list = rel_events_sub.add_parser("list", help="List reconciliation events.")
+    _add_common_paths(p_rel_events_list)
+    p_rel_events_list.add_argument("--limit", type=int, default=50, help="Limit rows (default: 50).")
+    p_rel_events_list.set_defaults(fn=cmd_reliability_events_list)
+
+    p_rel_resume = rel_sub.add_parser("resume", help="Resume automation after successful reconciliation.")
+    _add_common_paths(p_rel_resume)
+    p_rel_resume.add_argument("--i-am-human", action="store_true", required=True, help="Required safety flag.")
+    p_rel_resume.add_argument("--global", dest="global_pause", action="store_true", help="Resume global automation.")
+    p_rel_resume.add_argument("--symbol", type=str, default=None, help="Resume automation for a symbol (e.g. SOLUSDT).")
+    p_rel_resume.add_argument("--loop-id", type=int, default=None, help="Resume automation for a loop id.")
+    p_rel_resume.set_defaults(fn=cmd_reliability_resume)
 
     p_ex = sub.add_parser("exchange", help="Binance Spot connectivity utilities (no trading).")
     _add_common_paths(p_ex)

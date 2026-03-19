@@ -75,6 +75,30 @@ class StateManager:
             (now,),
         )
 
+    def set_automation_paused(self, *, paused: bool, reason: str | None, status: str | None = None) -> None:
+        now = utcnow_iso()
+        self.ensure_system_state()
+        self._conn.execute(
+            """
+            UPDATE system_state
+            SET automation_paused = ?,
+                pause_reason = ?,
+                paused_at_utc = ?,
+                last_reconciliation_status = COALESCE(?, last_reconciliation_status),
+                updated_at_utc = ?
+            WHERE id = 1
+            """,
+            (1 if paused else 0, reason, now if paused else None, status, now),
+        )
+
+    def update_reconciliation_status(self, *, status: str) -> None:
+        now = utcnow_iso()
+        self.ensure_system_state()
+        self._conn.execute(
+            "UPDATE system_state SET last_reconciliation_status = ?, updated_at_utc = ? WHERE id = 1",
+            (status, now),
+        )
+
     def update_system_start(self, *, current_mode: str) -> None:
         now = utcnow_iso()
         self.ensure_system_state()
@@ -1107,6 +1131,104 @@ class StateManager:
             (int(limit),),
         )
         return [dict(r) for r in cur.fetchall()]
+
+    def create_reconciliation_event(
+        self,
+        *,
+        event_type: str,
+        status: str,
+        summary: str,
+        details: dict | None = None,
+    ) -> int:
+        now = utcnow_iso()
+        cur = self._conn.execute(
+            """
+            INSERT INTO reconciliation_events(
+              event_type, status, summary, details_json, created_at_utc, updated_at_utc
+            )
+            VALUES(?, ?, ?, ?, ?, ?)
+            """,
+            (event_type, status, summary, json.dumps(details or {}, separators=(",", ":")), now, now),
+        )
+        return int(cur.lastrowid)
+
+    def list_reconciliation_events(self, *, limit: int = 50) -> list[dict]:
+        cur = self._conn.execute(
+            """
+            SELECT reconciliation_event_id, event_type, status, summary, created_at_utc
+            FROM reconciliation_events
+            ORDER BY reconciliation_event_id DESC
+            LIMIT ?
+            """,
+            (int(limit),),
+        )
+        return [dict(r) for r in cur.fetchall()]
+
+    def set_pause(self, *, scope_type: str, scope_key: str, reason: str | None) -> None:
+        now = utcnow_iso()
+        self._conn.execute(
+            """
+            INSERT INTO automation_pauses(scope_type, scope_key, status, reason, created_at_utc, updated_at_utc)
+            VALUES(?, ?, 'active', ?, ?, ?)
+            """,
+            (scope_type, scope_key, reason, now, now),
+        )
+
+    def clear_pause(self, *, scope_type: str, scope_key: str) -> None:
+        now = utcnow_iso()
+        self._conn.execute(
+            """
+            UPDATE automation_pauses
+            SET status = 'cleared', updated_at_utc = ?
+            WHERE scope_type = ? AND scope_key = ? AND status = 'active'
+            """,
+            (now, scope_type, scope_key),
+        )
+
+    def clear_all_scoped_pauses(self) -> None:
+        now = utcnow_iso()
+        self._conn.execute(
+            "UPDATE automation_pauses SET status = 'cleared', updated_at_utc = ? WHERE status = 'active'",
+            (now,),
+        )
+
+    def list_active_pauses(self) -> list[dict]:
+        cur = self._conn.execute(
+            """
+            SELECT pause_id, scope_type, scope_key, reason, created_at_utc
+            FROM automation_pauses
+            WHERE status = 'active'
+            ORDER BY pause_id DESC
+            """
+        )
+        return [dict(r) for r in cur.fetchall()]
+
+    def is_loop_paused(self, *, loop_id: int) -> bool:
+        cur = self._conn.execute(
+            "SELECT 1 FROM automation_pauses WHERE scope_type = 'loop' AND scope_key = ? AND status = 'active' LIMIT 1",
+            (str(loop_id),),
+        )
+        return cur.fetchone() is not None
+
+    def is_symbol_paused(self, *, symbol: str) -> bool:
+        cur = self._conn.execute(
+            "SELECT 1 FROM automation_pauses WHERE scope_type = 'symbol' AND scope_key = ? AND status = 'active' LIMIT 1",
+            (str(symbol).upper(),),
+        )
+        return cur.fetchone() is not None
+
+    def close_position_external(self, *, position_id: int, reason: str | None = None) -> None:
+        now = utcnow_iso()
+        self._conn.execute(
+            """
+            UPDATE positions
+            SET status = 'CLOSED',
+                closed_at_utc = ?,
+                updated_at_utc = ?
+            WHERE id = ? AND status = 'OPEN'
+            """,
+            (now, now, int(position_id)),
+        )
 
     def create_monitoring_event(
         self,

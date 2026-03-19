@@ -8,7 +8,7 @@ version = "0.1.0"
 description = "Local, safety-first Binance Spot trading agent (LLM advisory only)."
 readme = "README.md"
 requires-python = ">=3.11"
-authors = [{ name = "CryptoGent Contributors" }]
+authors = [{ name = "Tanjim Abubokor" }]
 dependencies = []
 
 [project.scripts]
