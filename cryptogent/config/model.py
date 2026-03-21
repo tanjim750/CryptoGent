@@ -22,3 +22,13 @@ class AppConfig:
     trading_default_stop_loss_pct: str
     trading_auto_cancel_expired_limit_orders: bool
     trading_monitoring_interval_seconds: int | None
+
+    market_volume_window_fast: int
+    market_volume_window_slow: int
+    market_volume_spike_ratio: float
+    market_volume_zscore_threshold: float
+    market_volume_buy_ratio: float
+    market_volume_sell_ratio: float
+    market_volume_depth_limit: int
+    market_volume_wall_ratio: float
+    market_volume_imbalance_threshold: float

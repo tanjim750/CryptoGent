@@ -101,6 +101,17 @@ def ensure_default_config(config_path: Path) -> Path:
                 "monitoring_interval_seconds = 60",
                 "auto_cancel_expired_limit_orders = true",
                 "",
+                "[market]",
+                "volume_window_fast = 20",
+                "volume_window_slow = 50",
+                "volume_spike_ratio = 2.0",
+                "volume_zscore_threshold = 2.0",
+                "volume_buy_ratio = 0.55",
+                "volume_sell_ratio = 0.45",
+                "volume_depth_limit = 50",
+                "volume_wall_ratio = 3.0",
+                "volume_imbalance_threshold = 0.2",
+                "",
             ]
         ),
         encoding="utf-8",
@@ -116,6 +127,7 @@ def load_config(config_path: Path) -> AppConfig:
     binance = data.get("binance", {})
     binance_testnet = data.get("binance_testnet", {})
     trading = data.get("trading", {})
+    market = data.get("market", {})
 
     db_path = Path(app.get("db_path") or DEFAULT_DB_PATH).expanduser()
 
@@ -176,4 +188,13 @@ def load_config(config_path: Path) -> AppConfig:
         trading_default_stop_loss_pct=default_stop_loss_pct,
         trading_auto_cancel_expired_limit_orders=auto_cancel_expired_limit_orders,
         trading_monitoring_interval_seconds=monitoring_interval_seconds,
+        market_volume_window_fast=int(market.get("volume_window_fast") or 20),
+        market_volume_window_slow=int(market.get("volume_window_slow") or 50),
+        market_volume_spike_ratio=float(market.get("volume_spike_ratio") or 2.0),
+        market_volume_zscore_threshold=float(market.get("volume_zscore_threshold") or 2.0),
+        market_volume_buy_ratio=float(market.get("volume_buy_ratio") or 0.55),
+        market_volume_sell_ratio=float(market.get("volume_sell_ratio") or 0.45),
+        market_volume_depth_limit=int(market.get("volume_depth_limit") or 50),
+        market_volume_wall_ratio=float(market.get("volume_wall_ratio") or 3.0),
+        market_volume_imbalance_threshold=float(market.get("volume_imbalance_threshold") or 0.2),
     )

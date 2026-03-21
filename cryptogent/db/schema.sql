@@ -96,6 +96,7 @@ CREATE TABLE IF NOT EXISTS positions (
   execution_environment TEXT NOT NULL,
   entry_price TEXT NOT NULL,
   quantity TEXT NOT NULL,
+  locked_qty TEXT NOT NULL DEFAULT '0',
   source_execution_id INTEGER,
   gross_quantity TEXT,
   fee_amount TEXT,
@@ -119,6 +120,23 @@ CREATE TABLE IF NOT EXISTS dust_ledger (
   needs_reconcile INTEGER NOT NULL DEFAULT 1,
   created_at_utc TEXT NOT NULL,
   updated_at_utc TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS market_snapshots (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  symbol TEXT NOT NULL,
+  timeframe TEXT NOT NULL,
+  captured_at_utc TEXT NOT NULL,
+  last_price TEXT NOT NULL,
+  bid TEXT,
+  ask TEXT,
+  spread_pct TEXT,
+  change_percent TEXT,
+  volume_quote TEXT,
+  indicators_json TEXT,
+  condition_summary TEXT,
+  enabled_flags TEXT,
+  config_hash TEXT
 );
 
 CREATE TABLE IF NOT EXISTS trade_plans (
@@ -167,6 +185,7 @@ CREATE TABLE IF NOT EXISTS execution_candidates (
   order_type TEXT NOT NULL,
   limit_price TEXT,
   execution_environment TEXT NOT NULL,
+  position_id INTEGER,
   validation_status TEXT NOT NULL,
   risk_status TEXT NOT NULL,
   approved_budget_asset TEXT NOT NULL,
@@ -192,6 +211,7 @@ CREATE TABLE IF NOT EXISTS executions (
   side TEXT NOT NULL,
   order_type TEXT NOT NULL,
   execution_environment TEXT NOT NULL,
+  position_id INTEGER,
   client_order_id TEXT NOT NULL,
   binance_order_id TEXT,
   quote_order_qty TEXT,

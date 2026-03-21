@@ -345,6 +345,7 @@ def execute_market_buy_quote(
         elif raw_status == "PARTIALLY_FILLED":
             local_status = "partially_filled"
 
+        fee_breakdown_json = _safe_json(fills.commission_breakdown) if fills and fills.commission_breakdown else None
         state.update_execution(
             execution_id=execution_id,
             local_status=local_status,
@@ -355,6 +356,7 @@ def execute_market_buy_quote(
             total_quote_spent=str(fills.total_quote_spent) if fills else None,
             commission_total=str(fills.commission_total) if fills and fills.commission_total is not None else None,
             commission_asset=(fills.commission_asset if fills else None),
+            fee_breakdown_json=fee_breakdown_json,
             fills_count=(fills.fills_count if fills else None),
             retry_count=retry_count,
             message=note,
@@ -633,6 +635,7 @@ def execute_limit_buy(
         elif raw_status in ("EXPIRED",):
             local_status = "expired"
 
+        fee_breakdown_json = _safe_json(fills.commission_breakdown) if fills and fills.commission_breakdown else None
         state.update_execution(
             execution_id=execution_id,
             local_status=local_status,
@@ -643,6 +646,7 @@ def execute_limit_buy(
             total_quote_spent=str(fills.total_quote_spent) if fills else None,
             commission_total=str(fills.commission_total) if fills and fills.commission_total is not None else None,
             commission_asset=(fills.commission_asset if fills else None),
+            fee_breakdown_json=fee_breakdown_json,
             fills_count=(fills.fills_count if fills else None),
             retry_count=retry_count,
             message=note,
@@ -835,6 +839,7 @@ def execute_market_sell_qty(
         raise ExecutionError("min_notional_failed")
 
     client_order_id = generate_client_order_id(candidate_id=candidate_id)
+    position_id = candidate.get("position_id")
     execution_id = state.create_execution(
         candidate_id=candidate_id,
         plan_id=plan_id,
@@ -844,6 +849,7 @@ def execute_market_sell_qty(
         order_type="MARKET_SELL",
         execution_environment=runtime_environment,
         client_order_id=client_order_id,
+        position_id=int(position_id) if position_id not in (None, "") else None,
         quote_order_qty=None,
         requested_quantity=str(qty),
     )
@@ -1088,6 +1094,7 @@ def execute_limit_sell(
 
     client_order_id = generate_client_order_id(candidate_id=candidate_id)
     time_in_force = "GTC"
+    position_id = candidate.get("position_id")
     execution_id = state.create_execution(
         candidate_id=candidate_id,
         plan_id=plan_id,
@@ -1097,6 +1104,7 @@ def execute_limit_sell(
         order_type="LIMIT_SELL",
         execution_environment=runtime_environment,
         client_order_id=client_order_id,
+        position_id=int(position_id) if position_id not in (None, "") else None,
         quote_order_qty=None,
         limit_price=str(limit_price),
         time_in_force=time_in_force,

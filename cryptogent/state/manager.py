@@ -582,6 +582,7 @@ class StateManager:
         order_type: str,
         limit_price: str | None,
         execution_environment: str,
+        position_id: int | None,
         validation_status: str,
         risk_status: str,
         approved_budget_asset: str,
@@ -596,13 +597,13 @@ class StateManager:
             """
             INSERT INTO execution_candidates(
               trade_plan_id, trade_request_id, request_id,
-              symbol, side, order_type, limit_price, execution_environment,
+              symbol, side, order_type, limit_price, execution_environment, position_id,
               validation_status, risk_status,
               approved_budget_asset, approved_budget_amount, approved_quantity,
               execution_ready, summary, details_json,
               created_at_utc, updated_at_utc
             )
-            VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 int(trade_plan_id),
@@ -613,6 +614,7 @@ class StateManager:
                 order_type,
                 limit_price,
                 execution_environment,
+                int(position_id) if position_id is not None else None,
                 validation_status,
                 risk_status,
                 approved_budget_asset,
@@ -643,6 +645,7 @@ class StateManager:
         order_type: str,
         execution_environment: str,
         client_order_id: str,
+        position_id: int | None = None,
         quote_order_qty: str | None,
         limit_price: str | None = None,
         time_in_force: str | None = None,
@@ -653,7 +656,7 @@ class StateManager:
             """
             INSERT INTO executions(
               candidate_id, plan_id, trade_request_id,
-              symbol, side, order_type, execution_environment,
+              symbol, side, order_type, execution_environment, position_id,
               client_order_id, binance_order_id,
               quote_order_qty, limit_price, time_in_force, requested_quantity,
               executed_quantity, avg_fill_price, total_quote_spent,
@@ -662,7 +665,7 @@ class StateManager:
               submitted_at_utc, reconciled_at_utc,
               expired_at_utc, created_at_utc, updated_at_utc
             )
-            VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 int(candidate_id),
@@ -672,6 +675,7 @@ class StateManager:
                 side,
                 order_type,
                 execution_environment,
+                int(position_id) if position_id is not None else None,
                 client_order_id,
                 None,
                 quote_order_qty,
@@ -839,7 +843,7 @@ class StateManager:
 
     def has_nonterminal_execution_for_candidate(self, *, candidate_id: int) -> bool:
         """
-        Returns True if this candidate already has an execution attempt that is not terminal.
+        Returns True if this candidate already has an execution attempt.
         This prevents accidental duplicate executions from the same approved candidate.
         """
         cur = self._conn.execute(
@@ -847,7 +851,6 @@ class StateManager:
             SELECT 1
             FROM executions
             WHERE candidate_id = ?
-              AND local_status IN ('submitting','submitted','uncertain_submitted','filled','partially_filled')
             LIMIT 1
             """,
             (int(candidate_id),),
@@ -905,12 +908,12 @@ class StateManager:
             INSERT INTO positions(
               symbol, base_asset, quote_asset,
               market_data_environment, execution_environment,
-              entry_price, quantity,
+              entry_price, quantity, locked_qty,
               source_execution_id, gross_quantity, fee_amount, fee_asset,
               stop_loss_price, profit_target_price, deadline_utc,
               status, opened_at_utc, created_at_utc, updated_at_utc
             )
-            VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 symbol,
@@ -920,6 +923,7 @@ class StateManager:
                 execution_environment,
                 entry_price,
                 quantity,
+                "0",
                 int(source_execution_id) if source_execution_id is not None else None,
                 gross_quantity,
                 fee_amount,
@@ -934,6 +938,58 @@ class StateManager:
             ),
         )
         return int(cur.lastrowid)
+
+    def set_position_locked_qty(self, *, position_id: int, locked_qty: str) -> bool:
+        now = utcnow_iso()
+        cur = self._conn.execute(
+            "UPDATE positions SET locked_qty = ?, updated_at_utc = ? WHERE id = ?",
+            (locked_qty, now, int(position_id)),
+        )
+        return int(cur.rowcount) > 0
+
+    def get_position_reserved_sell_qty(self, *, position_id: int) -> Decimal:
+        cur = self._conn.execute(
+            """
+            SELECT requested_quantity, executed_quantity
+            FROM executions
+            WHERE position_id = ?
+              AND side = 'SELL'
+              AND local_status IN ('submitting','submitted','open','partially_filled','uncertain_submitted')
+            """,
+            (int(position_id),),
+        )
+        total = Decimal("0")
+        for r in cur.fetchall():
+            try:
+                requested = Decimal(str(r["requested_quantity"] or "0"))
+            except Exception:
+                requested = Decimal("0")
+            try:
+                executed = Decimal(str(r["executed_quantity"] or "0"))
+            except Exception:
+                executed = Decimal("0")
+            remaining = requested - executed
+            if remaining < 0:
+                remaining = Decimal("0")
+            if remaining > 0:
+                total += remaining
+        return total
+
+    def recompute_locked_qty_for_open_positions(self) -> int:
+        cur = self._conn.execute("SELECT id, quantity FROM positions WHERE status = 'OPEN'")
+        updated = 0
+        for r in cur.fetchall():
+            pos_id = int(r["id"])
+            reserved = self.get_position_reserved_sell_qty(position_id=pos_id)
+            try:
+                pos_qty = Decimal(str(r["quantity"] or "0"))
+            except Exception:
+                pos_qty = None
+            if pos_qty is not None and pos_qty >= 0:
+                reserved = min(reserved, pos_qty)
+            if self.set_position_locked_qty(position_id=pos_id, locked_qty=str(reserved)):
+                updated += 1
+        return updated
 
     def get_open_position_qty_by_asset(self) -> dict[str, Decimal]:
         cur = self._conn.execute("SELECT base_asset, quantity FROM positions WHERE status = 'OPEN' AND base_asset IS NOT NULL")
@@ -1124,6 +1180,119 @@ class StateManager:
         else:
             cur = self._conn.execute("SELECT * FROM positions ORDER BY id DESC LIMIT ?", (int(limit),))
         return [dict(r) for r in cur.fetchall()]
+
+    def create_market_snapshot(
+        self,
+        *,
+        symbol: str,
+        timeframe: str,
+        captured_at_utc: str,
+        last_price: str,
+        bid: str | None,
+        ask: str | None,
+        spread_pct: str | None,
+        change_percent: str | None,
+        volume_quote: str | None,
+        indicators_json: str | None,
+        condition_summary: str | None,
+        enabled_flags: str | None,
+        config_hash: str | None,
+    ) -> int:
+        cur = self._conn.execute(
+            """
+            INSERT INTO market_snapshots(
+              symbol, timeframe, captured_at_utc,
+              last_price, bid, ask, spread_pct, change_percent, volume_quote,
+              indicators_json, condition_summary, enabled_flags, config_hash
+            )
+            VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                symbol,
+                timeframe,
+                captured_at_utc,
+                last_price,
+                bid,
+                ask,
+                spread_pct,
+                change_percent,
+                volume_quote,
+                indicators_json,
+                condition_summary,
+                enabled_flags,
+                config_hash,
+            ),
+        )
+        return int(cur.lastrowid)
+
+    def get_latest_market_snapshot(self, *, symbol: str, timeframe: str) -> dict | None:
+        cur = self._conn.execute(
+            """
+            SELECT *
+            FROM market_snapshots
+            WHERE symbol = ? AND timeframe = ?
+            ORDER BY captured_at_utc DESC, id DESC
+            LIMIT 1
+            """,
+            (symbol, timeframe),
+        )
+        row = cur.fetchone()
+        return dict(row) if row else None
+
+    def list_market_snapshots(
+        self,
+        *,
+        limit: int = 50,
+        symbol: str | None = None,
+        timeframe: str | None = None,
+    ) -> list[dict]:
+        if symbol and timeframe:
+            cur = self._conn.execute(
+                """
+                SELECT *
+                FROM market_snapshots
+                WHERE symbol = ? AND timeframe = ?
+                ORDER BY captured_at_utc DESC, id DESC
+                LIMIT ?
+                """,
+                (symbol, timeframe, int(limit)),
+            )
+        elif symbol:
+            cur = self._conn.execute(
+                """
+                SELECT *
+                FROM market_snapshots
+                WHERE symbol = ?
+                ORDER BY captured_at_utc DESC, id DESC
+                LIMIT ?
+                """,
+                (symbol, int(limit)),
+            )
+        elif timeframe:
+            cur = self._conn.execute(
+                """
+                SELECT *
+                FROM market_snapshots
+                WHERE timeframe = ?
+                ORDER BY captured_at_utc DESC, id DESC
+                LIMIT ?
+                """,
+                (timeframe, int(limit)),
+            )
+        else:
+            cur = self._conn.execute(
+                "SELECT * FROM market_snapshots ORDER BY captured_at_utc DESC, id DESC LIMIT ?",
+                (int(limit),),
+            )
+        return [dict(r) for r in cur.fetchall()]
+
+    def get_market_snapshot(self, *, snapshot_id: int) -> dict | None:
+        cur = self._conn.execute(
+            "SELECT * FROM market_snapshots WHERE id = ?",
+            (int(snapshot_id),),
+        )
+        row = cur.fetchone()
+        return dict(row) if row else None
 
     def list_audit_logs(self, *, limit: int = 50) -> list[dict]:
         cur = self._conn.execute(

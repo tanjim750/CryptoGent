@@ -121,8 +121,12 @@ Also supports: `--ca-bundle`, `--insecure`, `--testnet`, `--base-url`.
   - Feasibility check: public market data (mainnet candles/stats/spread)
   Persists `VALID/INVALID/ERROR` + estimated quantity back into SQLite (no order placed).
 
+Notes:
+- `trade validate` currently requires `deadline_hours > 0` on the request for feasibility. If you create a request using `--deadline-minutes` or an ISO `--deadline`, validation will return `missing_trade_request_fields_for_feasibility`. Use `--deadline-hours` to avoid this.
+
 - `cryptogent trade plan build <trade_request_id>`  
   Builds and persists a deterministic Phase 5 trade plan (public market data + rules snapshot + sizing; no order placed).
+  Requires the trade request to be `VALID` (run `trade validate` first).
 
 - `cryptogent trade plan list [--limit N]`  
   Lists stored trade plans.
@@ -159,12 +163,12 @@ Notes:
   Show one stored execution attempt.
 
 - `cryptogent trade execution cancel <execution_id>`  
-  Cancels an open LIMIT_BUY execution on Binance using the stored `client_order_id` (then reconciles locally).
+  Cancels an open LIMIT_BUY / LIMIT_SELL execution on Binance using the stored `client_order_id`, reconciles locally, refreshes cached open orders, and recomputes position `locked_qty`.
 
 - `cryptogent trade reconcile`  
   Reconcile in-flight/uncertain/open executions with Binance using `GET /api/v3/order` by `origClientOrderId`.
-  Also marks open `LIMIT_BUY` executions as locally `expired` after `--limit-order-timeout-minutes` (default: 30). No auto-cancel by default.
-  Use `--auto-cancel-expired` (or config `trading.auto_cancel_expired_limit_orders = true`) to also cancel the order on Binance when it times out.
+  Also marks open `LIMIT_BUY` executions as locally `expired` after `--limit-order-timeout-minutes` (default: 30).
+  Use `--auto-cancel-expired` to also cancel the order on Binance when it times out. If not provided, CLI prompts (default: No).
 
 - `cryptogent trade reconcile-all`  
   Convenience reconcile loop that covers:
@@ -242,12 +246,12 @@ All loop commands that can submit/cancel require `--i-am-human`. Use `--dry-run`
   - Ctrl‑C: stop the local runner only (loop session remains `running`)
 
 - `cryptogent trade manual loop stop --i-am-human [--loop-id <id>]`  
-  Stops the loop (requires interactive confirmation) and applies the configured cleanup policy (default `cancel-open`), then refreshes cached balances/open orders.
+  Stops the loop (requires interactive confirmation) and applies the configured cleanup policy (default `cancel-open-and-exit`), then refreshes cached balances/open orders.
 
 ## Positions (Phase 8; no execution)
 
 - `cryptogent position list [--limit N]`  
-  List stored positions.
+  List stored positions (includes `LOCKED` reserved quantity from open SELL orders).
 
 - `cryptogent position show <position_id> [--live]`  
   Show one position. With `--live`, fetch current price using the position’s market-data environment and compute unrealized PnL (Decimal-safe).
@@ -265,12 +269,57 @@ All loop commands that can submit/cancel require `--i-am-human`. Use `--dry-run`
 - `cryptogent monitor events list [--limit N]`  
   List monitoring event history (includes decision + reason code).
 
+## Market (Phase 13; basic)
+
+- `cryptogent market status --symbol <SYM> --timeframe <TF> [--limit N] [--market-env mainnet_public|testnet]`  
+  Basic market status for a single timeframe (price, bid/ask, spread, 24h stats, and condition summary).
+  Timeframes include: 1m, 3m, 5m, 15m, 30m, 1h, 2h, 4h, 6h, 8h, 12h, 1d, 1w, 1M.
+  Options:
+  - `--json` output JSON only
+  - `--compact` single-line output
+  - `--table` key/value table
+  - `--cache 5s|60|1m|1h` cache TTL (uses recent saved snapshot when available)
+  - `--save-snapshot` persist snapshot
+  - `--momentum` include RSI/MACD/Stoch RSI
+  - `--trend` include EMA/SMA + crossovers
+  - `--volatility` include ATR + Bollinger
+  - `--volume` include volume + order book summary
+  - `--structure` include BOS/CHOCH + range/accumulation
+  - `--price-action` include support/resistance, breakout, and candlestick patterns
+  - `--execution` include execution-quality metrics (spread/slippage/depth)
+  - `--risk` include risk sizing (stop/TP/position size/leverage)
+  - `--quant` include quant metrics (correlation/stat signals/ML features)
+  - `--crypto` include funding rate + open interest (auto USDT‑M vs COIN‑M)
+  - `--risk-side long|short` side for risk sizing (default long)
+  - `--risk-entry P` override entry price for risk sizing
+  - `--risk-pct X` risk % of account (default 1)
+  - `--risk-account-balance Q` account balance to use for sizing (quote)
+  - `--risk-max-position-pct X` max position % cap (default 20)
+  - `--volume-depth N` order book depth for liquidity metrics (default from config)
+  - `--volume-window-fast N` fast volume MA window
+  - `--volume-window-slow N` slow volume MA window
+  - `--volume-spike-ratio X` spike ratio threshold
+  - `--volume-zscore X` z-score spike threshold
+  - `--volume-buy-ratio X` taker buy ratio for buy pressure
+  - `--volume-sell-ratio X` taker buy ratio for sell pressure
+  - `--volume-wall-ratio X` wall size multiple vs median
+  - `--volume-imbalance X` book imbalance threshold
+  - `--strict` fail if requested indicators are unavailable
+  - `--debug` print indicator debug values
+
+- `cryptogent market snapshot list [--limit N] [--symbol SYM] [--timeframe TF]`  
+  List stored market snapshots (most recent first).
+
+- `cryptogent market snapshot show <id>`  
+  Show full snapshot details and stored indicators.
+
 ## Orders (Open Orders Management)
 
 - `cryptogent orders cancel <order_id> [--i-am-human]`  
   Cancel a cached **open non‑MARKET** order by Binance `order_id` for sources `manual` or `execution`.
   External orders (`src=external`) cannot be cancelled.
   Manual orders require `--i-am-human`.
+  After cancel, refreshes cached open orders/balances and recomputes `locked_qty`.
 
 ## Reliability (Phase 9)
 

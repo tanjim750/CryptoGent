@@ -113,6 +113,7 @@ def evaluate_safety(
     symbol = str(plan.get("symbol") or "").strip().upper()
     if not symbol:
         errors.append("missing_symbol")
+    details: dict = {"symbol": symbol}
     approved_budget_asset = str(plan.get("approved_budget_asset") or "").strip().upper()
     if not approved_budget_asset:
         errors.append("missing_approved_budget_asset")
@@ -174,7 +175,7 @@ def evaluate_safety(
                 else:
                     expected_price_for_notional = limit_price
 
-    # Active position policy: one active position at a time (BUY opens, SELL closes).
+    # Active position policy: multiple active positions per symbol allowed; SELL closes a specific position.
     active: dict | None
     if is_sell and position_id is not None:
         active = state.get_position(position_id=int(position_id))
@@ -188,11 +189,11 @@ def evaluate_safety(
     else:
         active = state.get_active_position(symbol=symbol)
     if is_buy and active:
-        # Allow "dust" leftovers to not block new entries; close locally if remaining qty is below minQty.
+        # Multiple active positions per symbol are allowed. If the active position is dust-sized, close it locally.
         try:
             active_qty = _d(active.get("quantity"), "position.quantity")
         except SafetyError:
-            errors.append("active_position_exists")
+            warnings.append("active_position_exists")
         else:
             if min_qty > 0 and active_qty < min_qty:
                 try:
@@ -212,20 +213,23 @@ def evaluate_safety(
                     warnings.append(f"active_position_dust_closed:{active_qty}<{min_qty}")
                     active = None
                 except Exception:
-                    errors.append("active_position_exists")
+                    warnings.append("active_position_exists")
             else:
-                errors.append("active_position_exists")
+                warnings.append("active_position_exists")
     if is_sell and not active:
         errors.append("no_active_position")
     requested_sell_qty: Decimal | None = None
     pos_qty: Decimal | None = None
+    reserved_qty: Decimal | None = None
     if is_sell and active:
+        details["position_id"] = int(active.get("id") or 0)
         try:
             pos_qty = _d(active.get("quantity"), "position.quantity")
         except SafetyError as e:
             errors.append(f"invalid_active_position_quantity:{e}")
         else:
             cm = (close_mode or "all").strip().lower()
+            details["close_mode"] = cm
             if cm not in ("amount", "percent", "all"):
                 errors.append("invalid_close_mode")
             elif cm == "all":
@@ -248,8 +252,18 @@ def evaluate_safety(
                         requested_sell_qty = (pos_qty * close_percent) / Decimal("100")
 
             if requested_sell_qty is not None and requested_sell_qty > pos_qty:
-                warnings.append(f"sell_qty_clamped_to_position:{pos_qty}<{requested_sell_qty}")
-                requested_sell_qty = pos_qty
+                errors.append("insufficient_position_balance")
+
+        try:
+            reserved_qty = state.get_position_reserved_sell_qty(position_id=int(active.get("id")))
+        except Exception:
+            reserved_qty = None
+        if reserved_qty is not None:
+            details["reserved_sell_qty"] = str(reserved_qty)
+            try:
+                state.set_position_locked_qty(position_id=int(active.get("id")), locked_qty=str(reserved_qty))
+            except Exception:
+                pass
 
         try:
             fee_asset = str(active.get("fee_asset") or "").strip().upper()
@@ -361,18 +375,31 @@ def evaluate_safety(
                 max_tradable = free_base
                 if pos_qty is not None:
                     max_tradable = min(max_tradable, pos_qty)
+                available_tradable = max_tradable
+                if reserved_qty is not None:
+                    available_tradable = max(Decimal("0"), max_tradable - reserved_qty)
+                    details["available_to_sell"] = str(available_tradable)
                 if requested_sell_qty > max_tradable:
-                    warnings.append(f"sell_qty_clamped_to_tradable:{max_tradable}<{requested_sell_qty}")
-                    requested_sell_qty = max_tradable
+                    if cm == "all":
+                        requested_sell_qty = max_tradable
+                        warnings.append("sell_qty_clamped_to_tradable")
+                    else:
+                        errors.append("insufficient_free_base_balance")
+                if requested_sell_qty > available_tradable:
+                    if cm == "all":
+                        requested_sell_qty = available_tradable
+                        warnings.append("sell_qty_clamped_to_available")
+                    else:
+                        errors.append("insufficient_available_to_sell")
+                if not errors:
+                    approved_quantity = quantize_down(requested_sell_qty, step_size) if step_size > 0 else Decimal("0")
+                    if approved_quantity <= 0:
+                        errors.append("sell_qty_rounded_to_zero")
+                    elif approved_quantity != requested_sell_qty:
+                        warnings.append(f"sell_qty_rounded_down:{approved_quantity}<{requested_sell_qty}")
 
-                approved_quantity = quantize_down(requested_sell_qty, step_size) if step_size > 0 else Decimal("0")
-                if approved_quantity <= 0:
-                    errors.append("sell_qty_rounded_to_zero")
-                elif approved_quantity != requested_sell_qty:
-                    warnings.append(f"sell_qty_rounded_down:{approved_quantity}<{requested_sell_qty}")
-
-                if approved_quantity > free_base:
-                    errors.append("insufficient_free_base_balance")
+                    if approved_quantity > free_base:
+                        errors.append("insufficient_free_base_balance")
 
                 ref_price = limit_price if ot == "LIMIT_SELL" else live_price
                 if ref_price is None or ref_price <= 0:
@@ -391,6 +418,7 @@ def evaluate_safety(
         errors.append(f"live_balance_check_failed:{e}")
 
     if errors:
+        details_out = {**details, "warnings": warnings, "errors": errors}
         return SafetyDecision(
             category="unsafe",
             validation_status="failed",
@@ -401,11 +429,12 @@ def evaluate_safety(
             summary="Unsafe: one or more safety checks failed",
             warnings=warnings,
             errors=errors,
-            details={"symbol": symbol, "warnings": warnings, "errors": errors},
+            details=details_out,
             created_at_utc=utcnow_iso(),
         )
 
     if warnings:
+        details_out = {**details, "warnings": warnings}
         return SafetyDecision(
             category="safe_with_warning",
             validation_status="passed",
@@ -416,10 +445,11 @@ def evaluate_safety(
             summary="Safe with warnings",
             warnings=warnings,
             errors=[],
-            details={"symbol": symbol, "warnings": warnings},
+            details=details_out,
             created_at_utc=utcnow_iso(),
         )
 
+    details_out = {**details}
     return SafetyDecision(
         category="safe",
         validation_status="passed",
@@ -430,6 +460,6 @@ def evaluate_safety(
         summary="Safe to proceed to execution",
         warnings=[],
         errors=[],
-        details={"symbol": symbol},
+        details=details_out,
         created_at_utc=utcnow_iso(),
     )

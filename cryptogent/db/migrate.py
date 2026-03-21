@@ -5,7 +5,7 @@ from pathlib import Path
 from cryptogent.config.io import DEFAULT_DB_PATH, load_config
 from cryptogent.db.connection import connect
 
-TARGET_SCHEMA_VERSION = 27
+TARGET_SCHEMA_VERSION = 29
 
 
 def _read_schema_sql() -> str:
@@ -785,6 +785,35 @@ def _migrate_to_v17(conn) -> None:
     conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_manual_orders_client_order_id ON manual_orders(client_order_id)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_manual_orders_created_at ON manual_orders(created_at_utc)")
 
+
+def _migrate_to_v28(conn) -> None:
+    _add_column_if_missing(conn, "positions", "locked_qty", "locked_qty TEXT NOT NULL DEFAULT '0'")
+    _add_column_if_missing(conn, "execution_candidates", "position_id", "position_id INTEGER")
+    _add_column_if_missing(conn, "executions", "position_id", "position_id INTEGER")
+
+
+def _migrate_to_v29(conn) -> None:
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS market_snapshots (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          symbol TEXT NOT NULL,
+          timeframe TEXT NOT NULL,
+          captured_at_utc TEXT NOT NULL,
+          last_price TEXT NOT NULL,
+          bid TEXT,
+          ask TEXT,
+          spread_pct TEXT,
+          change_percent TEXT,
+          volume_quote TEXT,
+          indicators_json TEXT,
+          condition_summary TEXT,
+          enabled_flags TEXT,
+          config_hash TEXT
+        )
+        """
+    )
+
 def ensure_db_initialized(*, config_path: Path, db_path: Path | None) -> Path:
     cfg = load_config(config_path)
     resolved_db_path = (db_path or cfg.db_path or DEFAULT_DB_PATH).expanduser()
@@ -848,6 +877,10 @@ def ensure_db_initialized(*, config_path: Path, db_path: Path | None) -> Path:
             _migrate_to_v26(conn)
         if current < 27:
             _migrate_to_v27(conn)
+        if current < 28:
+            _migrate_to_v28(conn)
+        if current < 29:
+            _migrate_to_v29(conn)
         conn.execute(
             "INSERT OR REPLACE INTO app_meta(key, value) VALUES(?, ?)",
             ("schema_version", str(TARGET_SCHEMA_VERSION)),
