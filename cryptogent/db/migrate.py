@@ -5,7 +5,7 @@ from pathlib import Path
 from cryptogent.config.io import DEFAULT_DB_PATH, load_config
 from cryptogent.db.connection import connect
 
-TARGET_SCHEMA_VERSION = 29
+TARGET_SCHEMA_VERSION = 30
 
 
 def _read_schema_sql() -> str:
@@ -814,6 +814,25 @@ def _migrate_to_v29(conn) -> None:
         """
     )
 
+
+def _migrate_to_v30(conn) -> None:
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS fear_greed_index (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          value TEXT NOT NULL,
+          value_classification TEXT NOT NULL,
+          timestamp_utc TEXT NOT NULL,
+          time_until_update_s INTEGER,
+          source TEXT NOT NULL DEFAULT 'alternative.me',
+          raw_json TEXT NOT NULL,
+          created_at_utc TEXT NOT NULL,
+          updated_at_utc TEXT NOT NULL
+        )
+        """
+    )
+    conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_fear_greed_source_ts ON fear_greed_index(source, timestamp_utc)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_fear_greed_created ON fear_greed_index(created_at_utc)")
 def ensure_db_initialized(*, config_path: Path, db_path: Path | None) -> Path:
     cfg = load_config(config_path)
     resolved_db_path = (db_path or cfg.db_path or DEFAULT_DB_PATH).expanduser()
@@ -881,6 +900,8 @@ def ensure_db_initialized(*, config_path: Path, db_path: Path | None) -> Path:
             _migrate_to_v28(conn)
         if current < 29:
             _migrate_to_v29(conn)
+        if current < 30:
+            _migrate_to_v30(conn)
         conn.execute(
             "INSERT OR REPLACE INTO app_meta(key, value) VALUES(?, ?)",
             ("schema_version", str(TARGET_SCHEMA_VERSION)),

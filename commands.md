@@ -84,6 +84,9 @@ Also supports: `--ca-bundle`, `--insecure`, `--testnet`, `--base-url`.
 - `cryptogent sync open-orders [--symbol BTCUSDT]`  
   Sync open orders into SQLite (optionally filter by symbol).
 
+- `cryptogent sync fear-greed`  
+  Fetch and store the latest Fear & Greed Index reading (Alternative.me) into SQLite.
+
 ## Show (reads from SQLite; no network)
 
 - `cryptogent show balances [--all] [--limit N]`  
@@ -94,6 +97,9 @@ Also supports: `--ca-bundle`, `--insecure`, `--testnet`, `--base-url`.
 
 - `cryptogent show open-orders [--symbol BTCUSDT] [--limit N]`  
   Print cached open orders from SQLite (includes `src=execution|manual|external`).
+
+- `cryptogent show fear-greed [--limit N]`  
+  Print cached Fear & Greed Index readings from SQLite.
 
 - `cryptogent show audit [--limit N]`  
   Print recent audit log entries from SQLite (latest first).
@@ -280,6 +286,7 @@ All loop commands that can submit/cancel require `--i-am-human`. Use `--dry-run`
   - `--table` key/value table
   - `--cache 5s|60|1m|1h` cache TTL (uses recent saved snapshot when available)
   - `--save-snapshot` persist snapshot
+  - `--profile quick|trend|full` apply a preset analysis bundle
   - `--momentum` include RSI/MACD/Stoch RSI
   - `--trend` include EMA/SMA + crossovers
   - `--volatility` include ATR + Bollinger

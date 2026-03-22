@@ -139,6 +139,44 @@ class StateManager:
             (utcnow_iso(), json.dumps(payload, separators=(",", ":"))),
         )
 
+    def upsert_fear_greed(
+        self,
+        *,
+        value: int,
+        value_classification: str,
+        timestamp_utc: str,
+        time_until_update_s: int | None,
+        source: str,
+        raw_json: dict,
+    ) -> int:
+        now = utcnow_iso()
+        cur = self._conn.execute(
+            """
+            INSERT INTO fear_greed_index(
+              value, value_classification, timestamp_utc, time_until_update_s,
+              source, raw_json, created_at_utc, updated_at_utc
+            )
+            VALUES(?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(source, timestamp_utc) DO UPDATE SET
+              value = excluded.value,
+              value_classification = excluded.value_classification,
+              time_until_update_s = excluded.time_until_update_s,
+              raw_json = excluded.raw_json,
+              updated_at_utc = excluded.updated_at_utc
+            """,
+            (
+                str(value),
+                value_classification,
+                timestamp_utc,
+                time_until_update_s,
+                source,
+                json.dumps(raw_json, separators=(",", ":")),
+                now,
+                now,
+            ),
+        )
+        return int(cur.rowcount or 0)
+
     def upsert_balances(self, balances: Iterable[Balance]) -> None:
         now = utcnow_iso()
         self._conn.executemany(
@@ -451,6 +489,13 @@ class StateManager:
             sql += " LIMIT ?"
             params.append(int(limit))
         cur = self._conn.execute(sql, params)
+        return [dict(r) for r in cur.fetchall()]
+
+    def list_fear_greed(self, *, limit: int = 20) -> list[dict]:
+        cur = self._conn.execute(
+            "SELECT * FROM fear_greed_index ORDER BY timestamp_utc DESC LIMIT ?",
+            (int(limit),),
+        )
         return [dict(r) for r in cur.fetchall()]
 
     def get_cached_balance_free(self, *, asset: str) -> Decimal | None:

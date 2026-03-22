@@ -139,6 +139,21 @@ CREATE TABLE IF NOT EXISTS market_snapshots (
   config_hash TEXT
 );
 
+CREATE TABLE IF NOT EXISTS fear_greed_index (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  value TEXT NOT NULL,
+  value_classification TEXT NOT NULL,
+  timestamp_utc TEXT NOT NULL,
+  time_until_update_s INTEGER,
+  source TEXT NOT NULL DEFAULT 'alternative.me',
+  raw_json TEXT NOT NULL,
+  created_at_utc TEXT NOT NULL,
+  updated_at_utc TEXT NOT NULL
+);
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_fear_greed_source_ts ON fear_greed_index(source, timestamp_utc);
+CREATE INDEX IF NOT EXISTS idx_fear_greed_created ON fear_greed_index(created_at_utc);
+
 CREATE TABLE IF NOT EXISTS trade_plans (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   trade_request_id INTEGER NOT NULL,

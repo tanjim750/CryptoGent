@@ -44,6 +44,7 @@ from cryptogent.execution.executor import (
 from cryptogent.execution.result_parser import parse_fills
 from cryptogent.state.manager import OrderRow, StateManager
 from cryptogent.sync.binance_sync import startup_sync, sync_balances, sync_open_orders
+from cryptogent.sync.fear_greed_sync import sync_fear_greed
 from cryptogent.validation.trade_request import ValidationError, validate_trade_request
 from cryptogent.validation.binance_rules import parse_symbol_rules, precheck_market_buy, quantize_down, RuleError
 from cryptogent.planning.feasibility import FeasibilityError, evaluate_feasibility, freshness_and_consistency_checks
@@ -425,6 +426,23 @@ def cmd_sync_open_orders(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_sync_fear_greed(args: argparse.Namespace) -> int:
+    paths = ConfigPaths.from_cli(config_path=args.config, db_path=args.db)
+    config_path = ensure_default_config(paths.config_path)
+    db_path = ensure_db_initialized(config_path=config_path, db_path=paths.db_path)
+    with connect(db_path) as conn:
+        result = sync_fear_greed(
+            conn=conn,
+            ca_bundle=getattr(args, "ca_bundle", None),
+            insecure=bool(getattr(args, "insecure", False)),
+        )
+    if result.status != "ok":
+        print("ERROR (see `show audit` and `status`)")
+        return 2
+    print(f"OK kind={result.kind} rows={result.rows_upserted}")
+    return 0
+
+
 def cmd_show_balances(args: argparse.Namespace) -> int:
     paths = ConfigPaths.from_cli(config_path=args.config, db_path=args.db)
     config_path = ensure_default_config(paths.config_path)
@@ -480,6 +498,24 @@ def cmd_show_balances(args: argparse.Namespace) -> int:
         print(f"{asset:<12} {free_s:>18} {locked_s:>18} {updated_at:>22}")
     return 0
 
+
+def cmd_show_fear_greed(args: argparse.Namespace) -> int:
+    paths = ConfigPaths.from_cli(config_path=args.config, db_path=args.db)
+    config_path = ensure_default_config(paths.config_path)
+    db_path = ensure_db_initialized(config_path=config_path, db_path=paths.db_path)
+    with connect(db_path) as conn:
+        state = StateManager(conn)
+        rows = state.list_fear_greed(limit=args.limit)
+    if not rows:
+        print("(no fear & greed data cached)")
+        return 0
+    for r in rows:
+        ts = r.get("timestamp_utc")
+        value = r.get("value")
+        cls = r.get("value_classification")
+        source = r.get("source")
+        print(f"{ts} value={value} class={cls} source={source}")
+    return 0
 
 def cmd_show_open_orders(args: argparse.Namespace) -> int:
     paths = ConfigPaths.from_cli(config_path=args.config, db_path=args.db)
@@ -919,7 +955,8 @@ def cmd_menu(args: argparse.Namespace) -> int:
                 print(" 1) Startup sync")
                 print(" 2) Sync balances")
                 print(" 3) Sync open orders")
-                print(" 4) Back")
+                print(" 4) Sync fear & greed index")
+                print(" 5) Back")
                 sub = input("> ").strip()
                 if sub == "1":
                     cmd_sync_startup(_net_ns())
@@ -929,6 +966,8 @@ def cmd_menu(args: argparse.Namespace) -> int:
                     sym = _prompt("Symbol (optional)", default="").upper().strip() or None
                     cmd_sync_open_orders(_net_ns(symbol=sym))
                 elif sub == "4":
+                    cmd_sync_fear_greed(_net_ns())
+                elif sub == "5":
                     break
                 else:
                     print(_style("Invalid choice", fg="red"))
@@ -940,8 +979,9 @@ def cmd_menu(args: argparse.Namespace) -> int:
                 print(_style("Show (cached; no network)", fg="cyan", bold=True))
                 print(" 1) Show balances")
                 print(" 2) Show open orders")
-                print(" 3) Show audit logs")
-                print(" 4) Back")
+                print(" 3) Show fear & greed index")
+                print(" 4) Show audit logs")
+                print(" 5) Back")
                 sub = input("> ").strip()
                 if sub == "1":
                     limit_s = _prompt("How many rows?", default="25")
@@ -966,9 +1006,12 @@ def cmd_menu(args: argparse.Namespace) -> int:
                     limit_s = _prompt("How many rows?", default="50")
                     cmd_show_open_orders(argparse.Namespace(config=args.config, db=args.db, symbol=sym, limit=int(limit_s)))
                 elif sub == "3":
+                    limit_s = _prompt("How many rows?", default="20")
+                    cmd_show_fear_greed(argparse.Namespace(config=args.config, db=args.db, limit=int(limit_s)))
+                elif sub == "4":
                     limit_s = _prompt("How many entries?", default="50")
                     cmd_show_audit(argparse.Namespace(config=args.config, db=args.db, limit=int(limit_s)))
-                elif sub == "4":
+                elif sub == "5":
                     break
                 else:
                     print(_style("Invalid choice", fg="red"))
@@ -3033,6 +3076,25 @@ def cmd_market_status(args: argparse.Namespace) -> int:
             return 2
 
     market_env = str(getattr(args, "market_env", "mainnet_public") or "mainnet_public").strip().lower()
+
+    profile = str(getattr(args, "profile", "") or "").strip().lower()
+    if profile:
+        def _enable(flag: str) -> None:
+            if not getattr(args, flag, False):
+                setattr(args, flag, True)
+
+        if profile == "quick":
+            for f in ("momentum", "trend", "volatility"):
+                _enable(f)
+        elif profile == "trend":
+            for f in ("momentum", "trend", "structure", "price_action"):
+                _enable(f)
+        elif profile == "full":
+            for f in ("momentum", "trend", "volatility", "volume", "structure", "price_action", "execution", "quant", "crypto", "risk"):
+                _enable(f)
+        else:
+            print("Invalid --profile (use quick|trend|full)")
+            return 2
     if market_env not in ("mainnet_public", "testnet"):
         print("Invalid --market-env (mainnet_public|testnet)")
         return 2
@@ -3156,9 +3218,11 @@ def cmd_market_status(args: argparse.Namespace) -> int:
                         "condition": cond,
                         "momentum_pct": str(indicators.get("momentum_pct")) if indicators and indicators.get("momentum_pct") is not None else None,
                         "volatility_pct": str(indicators.get("volatility_pct")) if indicators and indicators.get("volatility_pct") is not None else None,
+                        "candle_count": str(indicators.get("candle_count")) if indicators and indicators.get("candle_count") is not None else None,
                     }
                     if indicators:
                         for key in (
+                            "candle_count",
                             "rsi",
                             "rsi_prev",
                             "rsi_zone",
@@ -3437,6 +3501,7 @@ def cmd_market_status(args: argparse.Namespace) -> int:
             "condition": cond,
             "momentum_pct": str(momentum),
             "volatility_pct": str(snap.candles.volatility_pct),
+            "candle_count": str(len(snap.klines)) if snap.klines is not None else None,
         }
 
     if not cache_hit and need_momentum:
@@ -4041,7 +4106,7 @@ def cmd_market_status(args: argparse.Namespace) -> int:
         print(_json.dumps(payload, separators=(",", ":")))
     elif getattr(args, "compact", False):
         summary = (
-            f"{symbol} {timeframe} price={payload.get('last_price')} spread_pct={payload.get('spread_pct')} "
+            f"{symbol} {timeframe} candles={payload.get('candle_count')} price={payload.get('last_price')} spread_pct={payload.get('spread_pct')} "
             f"chg24h={payload.get('change_pct_24h')} vol24h={payload.get('volume_quote_24h')} cond={cond}"
         )
         if getattr(args, "volume", False):
@@ -4075,6 +4140,7 @@ def cmd_market_status(args: argparse.Namespace) -> int:
         print("Market Status")
         print(f"- Symbol: {symbol}")
         print(f"- Timeframe: {timeframe}")
+        print(f"- Candles: {payload.get('candle_count')}")
         print(f"- Last Price: {payload.get('last_price')}")
         if payload.get("bid") is not None and payload.get("ask") is not None:
             print(f"- Best Bid: {payload.get('bid')}")
@@ -4733,6 +4799,8 @@ def cmd_market_status(args: argparse.Namespace) -> int:
                         "open_interest": payload.get("open_interest"),
                     }
                 )
+            if payload.get("candle_count") is not None:
+                indicators["candle_count"] = payload.get("candle_count")
             state.create_market_snapshot(
                 symbol=symbol,
                 timeframe=timeframe,
@@ -9055,6 +9123,11 @@ def build_parser() -> argparse.ArgumentParser:
     p_sync_oo.add_argument("--symbol", type=str, default=None, help="Optional symbol (e.g. BTCUSDT).")
     p_sync_oo.set_defaults(fn=cmd_sync_open_orders)
 
+    p_sync_fng = sync_sub.add_parser("fear-greed", help="Sync Fear & Greed Index into the local cache.")
+    _add_common_paths(p_sync_fng)
+    _add_exchange_tls_only_args(p_sync_fng)
+    p_sync_fng.set_defaults(fn=cmd_sync_fear_greed)
+
     p_show = sub.add_parser("show", help="Show cached state from SQLite (no network).")
     _add_common_paths(p_show)
     show_sub = p_show.add_subparsers(dest="show_cmd", required=True)
@@ -9077,6 +9150,11 @@ def build_parser() -> argparse.ArgumentParser:
     p_show_oo.add_argument("--symbol", type=str, default=None, help="Optional symbol (e.g. BTCUSDT).")
     p_show_oo.add_argument("--limit", type=int, default=None, help="Limit rows.")
     p_show_oo.set_defaults(fn=cmd_show_open_orders)
+
+    p_show_fng = show_sub.add_parser("fear-greed", help="Show cached Fear & Greed Index.")
+    _add_common_paths(p_show_fng)
+    p_show_fng.add_argument("--limit", type=int, default=20, help="Limit rows.")
+    p_show_fng.set_defaults(fn=cmd_show_fear_greed)
 
     p_show_audit = show_sub.add_parser("audit", help="Show cached audit log entries.")
     _add_common_paths(p_show_audit)
@@ -9497,6 +9575,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_market_status.add_argument("--table", action="store_true", help="Key/value table output.")
     p_market_status.add_argument("--cache", default=None, help="Cache TTL (e.g. 5s, 60, 1m, 1h).")
     p_market_status.add_argument("--save-snapshot", action="store_true", help="Persist a market snapshot.")
+    p_market_status.add_argument("--profile", choices=["quick", "trend", "full"], help="Preset analysis profile.")
     p_market_status.add_argument("--momentum", action="store_true", help="Include RSI/MACD/Stoch RSI section.")
     p_market_status.add_argument("--trend", action="store_true", help="Include EMA/SMA + crossover section.")
     p_market_status.add_argument("--volatility", action="store_true", help="Include ATR/Bollinger section.")
@@ -9523,7 +9602,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_market_status.add_argument("--risk-entry", type=float, default=None, help="Override entry price for risk sizing.")
     p_market_status.add_argument("--risk-pct", type=float, default=None, help="Risk percent of account (default 1).")
     p_market_status.add_argument("--risk-account-balance", type=float, default=None, help="Account balance to use for sizing (quote).")
-    p_market_status.add_argument("--risk-max-position-pct", type=float, default=None, help="Max position % cap (default 20).")
+    p_market_status.add_argument("--risk-max-position-pct", type=float, default=None, help="Max position %% cap (default 20).")
     p_market_status.add_argument("--benchmark", type=str, default=None, help="Benchmark symbol for quant correlation (default BTCUSDT).")
     p_market_status.add_argument("--quant-window", type=int, default=None, help="Quant lookback window in bars (default 200).")
     p_market_status.add_argument("--corr-method", type=str, default=None, help="Correlation method (default pearson).")
