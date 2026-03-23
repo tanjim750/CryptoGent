@@ -1,6 +1,7 @@
-.testing
-.cryptogent.sqlite3
-.cryptogent.toml
-.cryptogent.log
-.plan.md
-.phases
+testing
+cryptogent.sqlite3
+cryptogent.toml
+cryptogent.log
+plan.md
+phases
+telegram.session*

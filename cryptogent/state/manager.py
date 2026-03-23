@@ -177,6 +177,370 @@ class StateManager:
         )
         return int(cur.rowcount or 0)
 
+    def upsert_news_articles(
+        self,
+        *,
+        provider: str,
+        request_kind: str,
+        request_params: dict | None,
+        articles: Iterable[dict],
+    ) -> int:
+        articles_list = list(articles)
+        if not articles_list:
+            return 0
+        now = utcnow_iso()
+        request_params_json = json.dumps(request_params or {}, separators=(",", ":")) if request_params else None
+        rows: list[tuple] = []
+        for a in articles_list:
+            provider_article_id = str(a.get("provider_article_id") or "").strip()
+            title = str(a.get("title") or "").strip()
+            url = str(a.get("url") or "").strip()
+            published_at_utc = str(a.get("published_at_utc") or "").strip()
+            if not (provider_article_id and title and url and published_at_utc):
+                continue
+            rows.append(
+                (
+                    provider,
+                    provider_article_id,
+                    request_kind,
+                    request_params_json,
+                    title,
+                    a.get("description"),
+                    a.get("content"),
+                    url,
+                    a.get("image_url"),
+                    published_at_utc,
+                    a.get("lang"),
+                    a.get("source_id"),
+                    a.get("source_name"),
+                    a.get("source_url"),
+                    a.get("source_country"),
+                    now,
+                    json.dumps(a.get("raw_json") or {}, separators=(",", ":")),
+                    now,
+                    now,
+                )
+            )
+        if not rows:
+            return 0
+        self._conn.executemany(
+            """
+            INSERT INTO news_articles(
+              provider, provider_article_id, request_kind, request_params_json,
+              title, description, content, url, image_url,
+              published_at_utc, lang, source_id, source_name, source_url, source_country,
+              fetched_at_utc, raw_json, created_at_utc, updated_at_utc
+            )
+            VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(provider, provider_article_id) DO UPDATE SET
+              request_kind = excluded.request_kind,
+              request_params_json = excluded.request_params_json,
+              title = excluded.title,
+              description = excluded.description,
+              content = excluded.content,
+              url = excluded.url,
+              image_url = excluded.image_url,
+              published_at_utc = excluded.published_at_utc,
+              lang = excluded.lang,
+              source_id = excluded.source_id,
+              source_name = excluded.source_name,
+              source_url = excluded.source_url,
+              source_country = excluded.source_country,
+              fetched_at_utc = excluded.fetched_at_utc,
+              raw_json = excluded.raw_json,
+              updated_at_utc = excluded.updated_at_utc
+            """,
+            rows,
+        )
+        return len(rows)
+
+    def get_telegram_channel_state(self, *, channel: str) -> dict | None:
+        cur = self._conn.execute(
+            "SELECT * FROM telegram_channel_state WHERE channel = ?",
+            (channel,),
+        )
+        row = cur.fetchone()
+        return dict(row) if row else None
+
+    def upsert_telegram_channel_state(
+        self,
+        *,
+        channel: str,
+        last_message_id: int | None,
+        last_synced_at_utc: str,
+    ) -> None:
+        now = utcnow_iso()
+        self._conn.execute(
+            """
+            INSERT INTO telegram_channel_state(
+              channel, last_message_id, last_synced_at_utc, created_at_utc, updated_at_utc
+            )
+            VALUES(?, ?, ?, ?, ?)
+            ON CONFLICT(channel) DO UPDATE SET
+              last_message_id = excluded.last_message_id,
+              last_synced_at_utc = excluded.last_synced_at_utc,
+              updated_at_utc = excluded.updated_at_utc
+            """,
+            (channel, last_message_id, last_synced_at_utc, now, now),
+        )
+
+    def list_existing_telegram_event_hashes(self, hashes: Iterable[str]) -> set[str]:
+        hashes_list = [h for h in hashes if h]
+        if not hashes_list:
+            return set()
+        placeholders = ",".join("?" for _ in hashes_list)
+        cur = self._conn.execute(
+            f"SELECT event_hash FROM telegram_messages WHERE event_hash IN ({placeholders})",
+            hashes_list,
+        )
+        return {row[0] for row in cur.fetchall() if row and row[0]}
+
+    def upsert_telegram_messages(self, *, messages: Iterable[dict]) -> int:
+        messages_list = list(messages)
+        if not messages_list:
+            return 0
+        now = utcnow_iso()
+        rows: list[tuple] = []
+        for msg in messages_list:
+            channel = str(msg.get("channel") or "").strip()
+            message_id = msg.get("message_id")
+            published_at_utc = str(msg.get("published_at_utc") or "").strip()
+            if not (channel and message_id is not None and published_at_utc):
+                continue
+            rows.append(
+                (
+                    channel,
+                    int(message_id),
+                    published_at_utc,
+                    msg.get("text"),
+                    msg.get("views"),
+                    msg.get("forwards"),
+                    1 if msg.get("has_media") else 0,
+                    msg.get("source_type"),
+                    msg.get("sentiment_score"),
+                    msg.get("impact_score"),
+                    msg.get("event_hash"),
+                    json.dumps(msg.get("raw_json") or {}, separators=(",", ":")),
+                    now,
+                    now,
+                )
+            )
+        if not rows:
+            return 0
+        self._conn.executemany(
+            """
+            INSERT INTO telegram_messages(
+              channel, message_id, published_at_utc, text,
+              views, forwards, has_media, source_type,
+              sentiment_score, impact_score, event_hash,
+              raw_json, created_at_utc, updated_at_utc
+            )
+            VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(channel, message_id) DO UPDATE SET
+              published_at_utc = excluded.published_at_utc,
+              text = excluded.text,
+              views = excluded.views,
+              forwards = excluded.forwards,
+              has_media = excluded.has_media,
+              source_type = excluded.source_type,
+              sentiment_score = excluded.sentiment_score,
+              impact_score = excluded.impact_score,
+              event_hash = excluded.event_hash,
+              raw_json = excluded.raw_json,
+              updated_at_utc = excluded.updated_at_utc
+            """,
+            rows,
+        )
+        return len(rows)
+
+    def get_youtube_channel_state(self, *, channel_id: str) -> dict | None:
+        cur = self._conn.execute(
+            "SELECT * FROM youtube_channel_state WHERE channel_id = ?",
+            (channel_id,),
+        )
+        row = cur.fetchone()
+        return dict(row) if row else None
+
+    def upsert_youtube_channel_state(
+        self,
+        *,
+        channel_id: str,
+        channel_name: str | None,
+        last_video_published_at_utc: str | None,
+        last_synced_at_utc: str,
+    ) -> None:
+        now = utcnow_iso()
+        self._conn.execute(
+            """
+            INSERT INTO youtube_channel_state(
+              channel_id, channel_name, last_video_published_at_utc, last_synced_at_utc,
+              created_at_utc, updated_at_utc
+            )
+            VALUES(?, ?, ?, ?, ?, ?)
+            ON CONFLICT(channel_id) DO UPDATE SET
+              channel_name = excluded.channel_name,
+              last_video_published_at_utc = excluded.last_video_published_at_utc,
+              last_synced_at_utc = excluded.last_synced_at_utc,
+              updated_at_utc = excluded.updated_at_utc
+            """,
+            (channel_id, channel_name, last_video_published_at_utc, last_synced_at_utc, now, now),
+        )
+
+    def get_youtube_discovery_state(self, *, discovery_key: str) -> dict | None:
+        cur = self._conn.execute(
+            "SELECT * FROM youtube_discovery_state WHERE discovery_key = ?",
+            (discovery_key,),
+        )
+        row = cur.fetchone()
+        return dict(row) if row else None
+
+    def upsert_youtube_discovery_state(
+        self,
+        *,
+        discovery_key: str,
+        last_published_at_utc: str | None,
+        last_synced_at_utc: str,
+    ) -> None:
+        now = utcnow_iso()
+        self._conn.execute(
+            """
+            INSERT INTO youtube_discovery_state(
+              discovery_key, last_published_at_utc, last_synced_at_utc,
+              created_at_utc, updated_at_utc
+            )
+            VALUES(?, ?, ?, ?, ?)
+            ON CONFLICT(discovery_key) DO UPDATE SET
+              last_published_at_utc = excluded.last_published_at_utc,
+              last_synced_at_utc = excluded.last_synced_at_utc,
+              updated_at_utc = excluded.updated_at_utc
+            """,
+            (discovery_key, last_published_at_utc, last_synced_at_utc, now, now),
+        )
+
+    def upsert_youtube_videos(self, *, videos: Iterable[dict]) -> int:
+        videos_list = list(videos)
+        if not videos_list:
+            return 0
+        now = utcnow_iso()
+        rows: list[tuple] = []
+        for v in videos_list:
+            video_id = str(v.get("video_id") or "").strip()
+            channel_id = str(v.get("channel_id") or "").strip()
+            title = str(v.get("title") or "").strip()
+            published_at_utc = str(v.get("published_at_utc") or "").strip()
+            if not (video_id and channel_id and title and published_at_utc):
+                continue
+            rows.append(
+                (
+                    video_id,
+                    channel_id,
+                    v.get("channel_title"),
+                    title,
+                    v.get("description"),
+                    published_at_utc,
+                    json.dumps(v.get("tags") or [], separators=(",", ":")),
+                    v.get("view_count"),
+                    v.get("like_count"),
+                    v.get("comment_count"),
+                    json.dumps(v.get("topic_labels") or [], separators=(",", ":")),
+                    v.get("sentiment_score"),
+                    v.get("impact_score"),
+                    v.get("source_type"),
+                    json.dumps(v.get("raw_json") or {}, separators=(",", ":")),
+                    now,
+                    now,
+                )
+            )
+        if not rows:
+            return 0
+        self._conn.executemany(
+            """
+            INSERT INTO youtube_videos(
+              video_id, channel_id, channel_title, title, description,
+              published_at_utc, tags_json, view_count, like_count, comment_count,
+              topic_labels_json, sentiment_score, impact_score, source_type,
+              raw_json, created_at_utc, updated_at_utc
+            )
+            VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(video_id) DO UPDATE SET
+              channel_id = excluded.channel_id,
+              channel_title = excluded.channel_title,
+              title = excluded.title,
+              description = excluded.description,
+              published_at_utc = excluded.published_at_utc,
+              tags_json = excluded.tags_json,
+              view_count = excluded.view_count,
+              like_count = excluded.like_count,
+              comment_count = excluded.comment_count,
+              topic_labels_json = excluded.topic_labels_json,
+              sentiment_score = excluded.sentiment_score,
+              impact_score = excluded.impact_score,
+              source_type = excluded.source_type,
+              raw_json = excluded.raw_json,
+              updated_at_utc = excluded.updated_at_utc
+            """,
+            rows,
+        )
+        return len(rows)
+
+    def upsert_youtube_comments(self, *, comments: Iterable[dict]) -> int:
+        comments_list = list(comments)
+        if not comments_list:
+            return 0
+        now = utcnow_iso()
+        rows: list[tuple] = []
+        for c in comments_list:
+            video_id = str(c.get("video_id") or "").strip()
+            comment_id = str(c.get("comment_id") or "").strip()
+            published_at_utc = str(c.get("published_at_utc") or "").strip()
+            if not (video_id and comment_id and published_at_utc):
+                continue
+            rows.append(
+                (
+                    video_id,
+                    comment_id,
+                    published_at_utc,
+                    c.get("text"),
+                    c.get("like_count"),
+                    c.get("reply_count"),
+                    c.get("author_channel_id"),
+                    c.get("source_type"),
+                    json.dumps(c.get("topic_labels") or [], separators=(",", ":")),
+                    c.get("sentiment_score"),
+                    c.get("impact_score"),
+                    json.dumps(c.get("raw_json") or {}, separators=(",", ":")),
+                    now,
+                    now,
+                )
+            )
+        if not rows:
+            return 0
+        self._conn.executemany(
+            """
+            INSERT INTO youtube_comments(
+              video_id, comment_id, published_at_utc, text, like_count,
+              reply_count, author_channel_id, source_type, topic_labels_json,
+              sentiment_score, impact_score, raw_json, created_at_utc, updated_at_utc
+            )
+            VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(comment_id) DO UPDATE SET
+              video_id = excluded.video_id,
+              published_at_utc = excluded.published_at_utc,
+              text = excluded.text,
+              like_count = excluded.like_count,
+              reply_count = excluded.reply_count,
+              author_channel_id = excluded.author_channel_id,
+              source_type = excluded.source_type,
+              topic_labels_json = excluded.topic_labels_json,
+              sentiment_score = excluded.sentiment_score,
+              impact_score = excluded.impact_score,
+              raw_json = excluded.raw_json,
+              updated_at_utc = excluded.updated_at_utc
+            """,
+            rows,
+        )
+        return len(rows)
+
     def upsert_balances(self, balances: Iterable[Balance]) -> None:
         now = utcnow_iso()
         self._conn.executemany(
@@ -497,6 +861,43 @@ class StateManager:
             (int(limit),),
         )
         return [dict(r) for r in cur.fetchall()]
+
+    def get_latest_fear_greed(self) -> dict | None:
+        cur = self._conn.execute(
+            "SELECT * FROM fear_greed_index ORDER BY timestamp_utc DESC LIMIT 1"
+        )
+        row = cur.fetchone()
+        return dict(row) if row else None
+
+    def list_news_articles(self, *, provider: str | None = None, limit: int = 50) -> list[dict]:
+        params: list[object] = []
+        sql = "SELECT * FROM news_articles"
+        if provider:
+            sql += " WHERE provider = ?"
+            params.append(provider)
+        sql += " ORDER BY published_at_utc DESC, id DESC LIMIT ?"
+        params.append(int(limit))
+        cur = self._conn.execute(sql, params)
+        return [dict(r) for r in cur.fetchall()]
+
+    def get_latest_news_request(
+        self,
+        *,
+        provider: str,
+        request_kind: str,
+        request_params_json: str,
+    ) -> dict | None:
+        cur = self._conn.execute(
+            """
+            SELECT * FROM news_articles
+            WHERE provider = ? AND request_kind = ? AND request_params_json = ?
+            ORDER BY fetched_at_utc DESC, id DESC
+            LIMIT 1
+            """,
+            (provider, request_kind, request_params_json),
+        )
+        row = cur.fetchone()
+        return dict(row) if row else None
 
     def get_cached_balance_free(self, *, asset: str) -> Decimal | None:
         cur = self._conn.execute("SELECT free FROM balances WHERE asset = ?", (asset.strip().upper(),))

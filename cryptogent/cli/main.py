@@ -429,12 +429,14 @@ def cmd_sync_open_orders(args: argparse.Namespace) -> int:
 def cmd_sync_fear_greed(args: argparse.Namespace) -> int:
     paths = ConfigPaths.from_cli(config_path=args.config, db_path=args.db)
     config_path = ensure_default_config(paths.config_path)
+    cfg = load_config(config_path)
     db_path = ensure_db_initialized(config_path=config_path, db_path=paths.db_path)
     with connect(db_path) as conn:
         result = sync_fear_greed(
             conn=conn,
             ca_bundle=getattr(args, "ca_bundle", None),
             insecure=bool(getattr(args, "insecure", False)),
+            cache_ttl_s=cfg.fear_greed_cache_ttl_seconds,
         )
     if result.status != "ok":
         print("ERROR (see `show audit` and `status`)")

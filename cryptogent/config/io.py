@@ -5,7 +5,7 @@ import tomllib
 from dataclasses import dataclass
 from pathlib import Path
 
-from cryptogent.config.model import AppConfig
+from cryptogent.config.model import AppConfig, TwitterAccountConfig
 
 
 DEFAULT_CONFIG_PATH = Path("cryptogent.toml")
@@ -112,6 +112,67 @@ def ensure_default_config(config_path: Path) -> Path:
                 "volume_wall_ratio = 3.0",
                 "volume_imbalance_threshold = 0.2",
                 "",
+                "[gnews]",
+                'api_key = ""',
+                "cache_ttl_seconds = 3600",
+                "",
+                "[fear_greed]",
+                "cache_ttl_seconds = 3600",
+                "",
+                "[reddit]",
+                'client_id = ""',
+                'client_secret = ""',
+                'device_id = ""  # optional for installed-client flow',
+                'user_agent = "cryptogent/1.0 (reddit client)"',
+                "",
+                "[telegram]",
+                'api_id = ""',
+                'api_hash = ""',
+                'phone = ""',
+                'session_path = "telegram.session"',
+                "backfill_limit = 200",
+                "join_channels = true",
+                "channels = [",
+                '  "binance_announcements",',
+                '  "binance_api_announcements",',
+                '  "cointelegraph",',
+                '  "wublockchainenglish",',
+                '  "lookonchainchannel",',
+                "]",
+                "keywords = [",
+                '  "BTC", "ETH", "SOL", "BNB",',
+                '  "listing", "delisting",',
+                '  "hack", "exploit",',
+                '  "ETF", "SEC",',
+                '  "liquidation", "unlock"',
+                "]",
+                "",
+                "[youtube]",
+                'api_key = ""',
+                "backfill_limit = 50",
+                "comment_limit = 50",
+                'language = "en"',
+                "channels = [",
+                '  # "CoinDesk",',
+                "]",
+                "keywords = [",
+                '  "BTC", "ETH", "SOL", "BNB",',
+                '  "ETF", "SEC",',
+                '  "hack", "exploit",',
+                '  "liquidation", "unlock"',
+                "]",
+                "",
+                "[twitter]",
+                'user_agent = "cryptogent/1.0 (twscrape)"',
+                '# db_path = "twscrape.sqlite3"  # optional local db for twscrape accounts',
+                "# At least one account is required for scraping.",
+                "[[twitter.accounts]]",
+                'username = ""',
+                'password = ""',
+                'email = ""',
+                'email_password = ""',
+                'phone = ""',
+                "",
             ]
         ),
         encoding="utf-8",
@@ -128,6 +189,13 @@ def load_config(config_path: Path) -> AppConfig:
     binance_testnet = data.get("binance_testnet", {})
     trading = data.get("trading", {})
     market = data.get("market", {})
+    gnews = data.get("gnews", {})
+    fear_greed = data.get("fear_greed", {})
+    reddit = data.get("reddit", {})
+    twitter = data.get("twitter", {})
+    telegram = data.get("telegram", {})
+    youtube = data.get("youtube", {})
+    twscrape = data.get("twscrape", {})
 
     db_path = Path(app.get("db_path") or DEFAULT_DB_PATH).expanduser()
 
@@ -197,4 +265,114 @@ def load_config(config_path: Path) -> AppConfig:
         market_volume_depth_limit=int(market.get("volume_depth_limit") or 50),
         market_volume_wall_ratio=float(market.get("volume_wall_ratio") or 3.0),
         market_volume_imbalance_threshold=float(market.get("volume_imbalance_threshold") or 0.2),
+        gnews_api_key=(str(gnews.get("api_key")).strip() if gnews.get("api_key") not in (None, "") else None),
+        gnews_cache_ttl_seconds=int(gnews.get("cache_ttl_seconds") or 3600),
+        fear_greed_cache_ttl_seconds=int(fear_greed.get("cache_ttl_seconds") or 3600),
+        reddit_client_id=(str(reddit.get("client_id")).strip() if reddit.get("client_id") not in (None, "") else None),
+        reddit_client_secret=(
+            str(reddit.get("client_secret")).strip() if reddit.get("client_secret") not in (None, "") else None
+        ),
+        reddit_device_id=(str(reddit.get("device_id")).strip() if reddit.get("device_id") not in (None, "") else None),
+        reddit_user_agent=(
+            str(reddit.get("user_agent")).strip() if reddit.get("user_agent") not in (None, "") else None
+        ),
+        twitter_accounts=_parse_twitter_accounts(twitter.get("accounts"), default_user_agent=twitter.get("user_agent")),
+        twitter_user_agent=(
+            str(twitter.get("user_agent")).strip() if twitter.get("user_agent") not in (None, "") else None
+        ),
+        twitter_db_path=(
+            Path(str(twitter.get("db_path"))).expanduser() if twitter.get("db_path") not in (None, "") else None
+        ),
+        telegram_api_id=_as_optional_int(telegram.get("api_id")),
+        telegram_api_hash=(str(telegram.get("api_hash")).strip() if telegram.get("api_hash") not in (None, "") else None),
+        telegram_phone=(str(telegram.get("phone")).strip() if telegram.get("phone") not in (None, "") else None),
+        telegram_session_path=(
+            Path(str(telegram.get("session_path"))).expanduser()
+            if telegram.get("session_path") not in (None, "")
+            else None
+        ),
+        telegram_backfill_limit=int(telegram.get("backfill_limit") or 200),
+        telegram_join_channels=_as_bool(telegram.get("join_channels"), True),
+        telegram_channels=_as_string_list(telegram.get("channels")),
+        telegram_keywords=_as_string_list(telegram.get("keywords")),
+        youtube_api_key=(str(youtube.get("api_key")).strip() if youtube.get("api_key") not in (None, "") else None),
+        youtube_keywords=_as_string_list(youtube.get("keywords")),
+        youtube_channels=_as_string_list(youtube.get("channels")),
+        youtube_backfill_limit=int(youtube.get("backfill_limit") or 50),
+        youtube_comment_limit=int(youtube.get("comment_limit") or 50),
+        youtube_language=(
+            str(youtube.get("language")).strip() if youtube.get("language") not in (None, "") else None
+        ),
+        twscrape_db_path=(
+            Path(str(twscrape.get("db_path"))).expanduser() if twscrape.get("db_path") not in (None, "") else None
+        ),
+        twscrape_accounts_json=(
+            Path(str(twscrape.get("accounts_json"))).expanduser()
+            if twscrape.get("accounts_json") not in (None, "")
+            else None
+        ),
     )
+
+
+def _as_optional_int(value: object) -> int | None:
+    if value is None:
+        return None
+    if isinstance(value, int):
+        return value
+    if isinstance(value, str) and value.strip():
+        try:
+            return int(value.strip())
+        except Exception:
+            return None
+    return None
+
+
+def _as_string_list(value: object) -> tuple[str, ...]:
+    if value is None:
+        return ()
+    if isinstance(value, (list, tuple)):
+        items = [str(v).strip() for v in value if str(v).strip()]
+        return tuple(items)
+    if isinstance(value, str):
+        v = value.strip()
+        return (v,) if v else ()
+    return ()
+
+
+def _parse_twitter_accounts(
+    raw: object, *, default_user_agent: object | None = None
+) -> tuple[TwitterAccountConfig, ...]:
+    if raw is None:
+        return ()
+    if isinstance(raw, dict):
+        raw_list = [raw]
+    elif isinstance(raw, list):
+        raw_list = raw
+    else:
+        return ()
+
+    accounts: list[TwitterAccountConfig] = []
+    for item in raw_list:
+        if not isinstance(item, dict):
+            continue
+        username = str(item.get("username") or "").strip()
+        password = str(item.get("password") or "").strip()
+        if not username or not password:
+            continue
+        email = str(item.get("email") or "").strip() or None
+        email_password = str(item.get("email_password") or "").strip() or None
+        phone = str(item.get("phone") or "").strip() or None
+        user_agent = str(item.get("user_agent") or "").strip() or None
+        if not user_agent and default_user_agent not in (None, ""):
+            user_agent = str(default_user_agent).strip()
+        accounts.append(
+            TwitterAccountConfig(
+                username=username,
+                password=password,
+                email=email,
+                email_password=email_password,
+                phone=phone,
+                user_agent=user_agent,
+            )
+        )
+    return tuple(accounts)
