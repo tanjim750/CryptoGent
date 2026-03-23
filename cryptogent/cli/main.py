@@ -16,7 +16,16 @@ from typing import Any
 from cryptogent.config.io import BINANCE_SPOT_BASE_URL, ConfigPaths, ensure_default_config
 from cryptogent.config.io import load_config
 from cryptogent.config.model import AppConfig
-from cryptogent.config.edit import BinanceCredentialUpdate, update_binance_config
+from cryptogent.config.edit import (
+    BinanceCredentialUpdate,
+    append_toml_table,
+    toml_bool,
+    toml_int,
+    toml_str,
+    update_binance_config,
+    update_config_list,
+    update_config_value,
+)
 from cryptogent.db.migrate import ensure_db_initialized
 from cryptogent.db.connection import connect
 from cryptogent.exchange.binance_errors import BinanceAPIError
@@ -59,6 +68,13 @@ def _safe_json(value: Any) -> str | None:
         return _json.dumps(value, separators=(",", ":"))
     except Exception:
         return None
+
+
+def _parse_csv_list(value: str | None) -> list[str]:
+    if not value:
+        return []
+    parts = [v.strip() for v in value.split(",")]
+    return [v for v in parts if v]
 
 
 def _add_common_paths(parser: argparse.ArgumentParser) -> None:
@@ -174,6 +190,103 @@ def cmd_config_set_binance(args: argparse.Namespace) -> int:
     except Exception:
         pass
     print(f"Updated: {config_path}")
+    return 0
+
+
+def cmd_config_set_youtube(args: argparse.Namespace) -> int:
+    paths = ConfigPaths.from_cli(config_path=args.config, db_path=args.db)
+    config_path = ensure_default_config(paths.config_path)
+    if args.api_key is not None:
+        update_config_value(config_path, section="youtube", key="api_key", value_repr=toml_str(args.api_key))
+    if args.backfill_limit is not None:
+        update_config_value(config_path, section="youtube", key="backfill_limit", value_repr=toml_int(args.backfill_limit))
+    if args.comment_limit is not None:
+        update_config_value(config_path, section="youtube", key="comment_limit", value_repr=toml_int(args.comment_limit))
+    if args.language is not None:
+        update_config_value(config_path, section="youtube", key="language", value_repr=toml_str(args.language))
+    if args.channels:
+        update_config_list(config_path, section="youtube", key="channels", values=_parse_csv_list(args.channels))
+    if args.keywords:
+        update_config_list(config_path, section="youtube", key="keywords", values=_parse_csv_list(args.keywords))
+    print(f"Updated: {config_path}")
+    return 0
+
+
+def cmd_config_set_telegram(args: argparse.Namespace) -> int:
+    paths = ConfigPaths.from_cli(config_path=args.config, db_path=args.db)
+    config_path = ensure_default_config(paths.config_path)
+    if args.api_id is not None:
+        update_config_value(config_path, section="telegram", key="api_id", value_repr=toml_int(args.api_id))
+    if args.api_hash is not None:
+        update_config_value(config_path, section="telegram", key="api_hash", value_repr=toml_str(args.api_hash))
+    if args.phone is not None:
+        update_config_value(config_path, section="telegram", key="phone", value_repr=toml_str(args.phone))
+    if args.session_path is not None:
+        update_config_value(config_path, section="telegram", key="session_path", value_repr=toml_str(args.session_path))
+    if args.backfill_limit is not None:
+        update_config_value(config_path, section="telegram", key="backfill_limit", value_repr=toml_int(args.backfill_limit))
+    if args.join_channels is not None:
+        update_config_value(config_path, section="telegram", key="join_channels", value_repr=toml_bool(args.join_channels))
+    if args.channels:
+        update_config_list(config_path, section="telegram", key="channels", values=_parse_csv_list(args.channels))
+    if args.keywords:
+        update_config_list(config_path, section="telegram", key="keywords", values=_parse_csv_list(args.keywords))
+    print(f"Updated: {config_path}")
+    return 0
+
+
+def cmd_config_set_reddit(args: argparse.Namespace) -> int:
+    paths = ConfigPaths.from_cli(config_path=args.config, db_path=args.db)
+    config_path = ensure_default_config(paths.config_path)
+    if args.client_id is not None:
+        update_config_value(config_path, section="reddit", key="client_id", value_repr=toml_str(args.client_id))
+    if args.client_secret is not None:
+        update_config_value(config_path, section="reddit", key="client_secret", value_repr=toml_str(args.client_secret))
+    if args.device_id is not None:
+        update_config_value(config_path, section="reddit", key="device_id", value_repr=toml_str(args.device_id))
+    if args.user_agent is not None:
+        update_config_value(config_path, section="reddit", key="user_agent", value_repr=toml_str(args.user_agent))
+    print(f"Updated: {config_path}")
+    return 0
+
+
+def cmd_config_set_gnews(args: argparse.Namespace) -> int:
+    paths = ConfigPaths.from_cli(config_path=args.config, db_path=args.db)
+    config_path = ensure_default_config(paths.config_path)
+    if args.api_key is not None:
+        update_config_value(config_path, section="gnews", key="api_key", value_repr=toml_str(args.api_key))
+    if args.cache_ttl is not None:
+        update_config_value(config_path, section="gnews", key="cache_ttl_seconds", value_repr=toml_int(args.cache_ttl))
+    print(f"Updated: {config_path}")
+    return 0
+
+
+def cmd_config_set_twitter(args: argparse.Namespace) -> int:
+    paths = ConfigPaths.from_cli(config_path=args.config, db_path=args.db)
+    config_path = ensure_default_config(paths.config_path)
+    if args.user_agent is not None:
+        update_config_value(config_path, section="twitter", key="user_agent", value_repr=toml_str(args.user_agent))
+    if args.db_path is not None:
+        update_config_value(config_path, section="twitter", key="db_path", value_repr=toml_str(args.db_path))
+    print(f"Updated: {config_path}")
+    return 0
+
+
+def cmd_config_add_twitter_account(args: argparse.Namespace) -> int:
+    paths = ConfigPaths.from_cli(config_path=args.config, db_path=args.db)
+    config_path = ensure_default_config(paths.config_path)
+    values: dict[str, object] = {
+        "username": args.username,
+        "password": args.password,
+        "email": args.email,
+        "email_password": args.email_password,
+    }
+    if args.phone:
+        values["phone"] = args.phone
+    if args.user_agent:
+        values["user_agent"] = args.user_agent
+    append_toml_table(config_path, table="twitter.accounts", values=values)
+    print(f"Updated: {config_path} (added twitter account)")
     return 0
 
 
@@ -8979,6 +9092,73 @@ def build_parser() -> argparse.ArgumentParser:
     g_burn.add_argument("--enabled", dest="enabled", action="store_true", help="Enable spotBNBBurn (pay Spot fees with BNB).")
     g_burn.add_argument("--disabled", dest="enabled", action="store_false", help="Disable spotBNBBurn.")
     p_cfg_set_burn.set_defaults(fn=cmd_config_set_bnb_burn)
+
+    p_cfg_set_youtube = cfg_sub.add_parser("set-youtube", help="Update YouTube API config in cryptogent.toml.")
+    _add_common_paths(p_cfg_set_youtube)
+    p_cfg_set_youtube.add_argument("--api-key", type=str, default=None, help="YouTube API key (public read-only).")
+    p_cfg_set_youtube.add_argument("--backfill-limit", type=int, default=None, help="Videos to backfill per run.")
+    p_cfg_set_youtube.add_argument("--comment-limit", type=int, default=None, help="Comments to fetch per video.")
+    p_cfg_set_youtube.add_argument("--language", type=str, default=None, help="Language filter (e.g. en).")
+    p_cfg_set_youtube.add_argument(
+        "--channels",
+        type=str,
+        default=None,
+        help="Comma-separated channel IDs/usernames (preferred: channel IDs starting with UC).",
+    )
+    p_cfg_set_youtube.add_argument(
+        "--keywords",
+        type=str,
+        default=None,
+        help="Comma-separated keyword list for discovery.",
+    )
+    p_cfg_set_youtube.set_defaults(fn=cmd_config_set_youtube)
+
+    p_cfg_set_telegram = cfg_sub.add_parser("set-telegram", help="Update Telegram config in cryptogent.toml.")
+    _add_common_paths(p_cfg_set_telegram)
+    p_cfg_set_telegram.add_argument("--api-id", type=int, default=None, help="Telegram API ID.")
+    p_cfg_set_telegram.add_argument("--api-hash", type=str, default=None, help="Telegram API hash.")
+    p_cfg_set_telegram.add_argument("--phone", type=str, default=None, help="Phone number for first login.")
+    p_cfg_set_telegram.add_argument("--session-path", type=str, default=None, help="Session file path.")
+    p_cfg_set_telegram.add_argument("--backfill-limit", type=int, default=None, help="Messages to backfill per channel.")
+    p_cfg_set_telegram.add_argument(
+        "--join-channels",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="Join public channels if needed.",
+    )
+    p_cfg_set_telegram.add_argument("--channels", type=str, default=None, help="Comma-separated channel usernames.")
+    p_cfg_set_telegram.add_argument("--keywords", type=str, default=None, help="Comma-separated keywords.")
+    p_cfg_set_telegram.set_defaults(fn=cmd_config_set_telegram)
+
+    p_cfg_set_reddit = cfg_sub.add_parser("set-reddit", help="Update Reddit API config in cryptogent.toml.")
+    _add_common_paths(p_cfg_set_reddit)
+    p_cfg_set_reddit.add_argument("--client-id", type=str, default=None, help="Reddit client_id.")
+    p_cfg_set_reddit.add_argument("--client-secret", type=str, default=None, help="Reddit client_secret.")
+    p_cfg_set_reddit.add_argument("--device-id", type=str, default=None, help="Reddit device_id.")
+    p_cfg_set_reddit.add_argument("--user-agent", type=str, default=None, help="Reddit user_agent.")
+    p_cfg_set_reddit.set_defaults(fn=cmd_config_set_reddit)
+
+    p_cfg_set_gnews = cfg_sub.add_parser("set-gnews", help="Update GNews API config in cryptogent.toml.")
+    _add_common_paths(p_cfg_set_gnews)
+    p_cfg_set_gnews.add_argument("--api-key", type=str, default=None, help="GNews API key.")
+    p_cfg_set_gnews.add_argument("--cache-ttl", type=int, default=None, help="Cache TTL seconds.")
+    p_cfg_set_gnews.set_defaults(fn=cmd_config_set_gnews)
+
+    p_cfg_set_twitter = cfg_sub.add_parser("set-twitter", help="Update Twitter/TwScrape config in cryptogent.toml.")
+    _add_common_paths(p_cfg_set_twitter)
+    p_cfg_set_twitter.add_argument("--user-agent", type=str, default=None, help="Twitter user agent.")
+    p_cfg_set_twitter.add_argument("--db-path", type=str, default=None, help="TwScrape DB path.")
+    p_cfg_set_twitter.set_defaults(fn=cmd_config_set_twitter)
+
+    p_cfg_add_tw_acc = cfg_sub.add_parser("add-twitter-account", help="Append a Twitter account to config.")
+    _add_common_paths(p_cfg_add_tw_acc)
+    p_cfg_add_tw_acc.add_argument("--username", type=str, required=True, help="Twitter username.")
+    p_cfg_add_tw_acc.add_argument("--password", type=str, required=True, help="Twitter password.")
+    p_cfg_add_tw_acc.add_argument("--email", type=str, required=True, help="Twitter email.")
+    p_cfg_add_tw_acc.add_argument("--email-password", type=str, required=True, help="Email password.")
+    p_cfg_add_tw_acc.add_argument("--phone", type=str, default=None, help="Phone (optional).")
+    p_cfg_add_tw_acc.add_argument("--user-agent", type=str, default=None, help="User agent override (optional).")
+    p_cfg_add_tw_acc.set_defaults(fn=cmd_config_add_twitter_account)
 
     p_status = sub.add_parser("status", help="Show local setup status.")
     _add_common_paths(p_status)

@@ -90,6 +90,26 @@ def _toml_value(value: bool | str) -> str:
     return _toml_str(value)
 
 
+def _toml_int(value: int) -> str:
+    return str(int(value))
+
+
+def _toml_list(values: list[str]) -> str:
+    return "[" + ", ".join(_toml_str(v) for v in values) + "]"
+
+
+def toml_str(value: str) -> str:
+    return _toml_str(value)
+
+
+def toml_bool(value: bool) -> str:
+    return _toml_bool(value)
+
+
+def toml_int(value: int) -> str:
+    return _toml_int(value)
+
+
 def update_binance_config(config_path: Path, update: BinanceCredentialUpdate) -> None:
     config_path = config_path.expanduser()
     raw = config_path.read_text(encoding="utf-8")
@@ -123,3 +143,51 @@ def update_binance_config(config_path: Path, update: BinanceCredentialUpdate) ->
 def update_binance_credentials(config_path: Path, update: BinanceCredentialUpdate) -> None:
     # Backward-compatible alias.
     update_binance_config(config_path, update)
+
+
+def update_config_value(
+    config_path: Path,
+    *,
+    section: str,
+    key: str,
+    value_repr: str,
+) -> None:
+    config_path = config_path.expanduser()
+    raw = config_path.read_text(encoding="utf-8")
+    lines = raw.splitlines()
+    lines = _set_kv_in_section(lines, section=section, key=key, value_repr=value_repr)
+    config_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+
+def update_config_list(
+    config_path: Path,
+    *,
+    section: str,
+    key: str,
+    values: list[str],
+) -> None:
+    update_config_value(config_path, section=section, key=key, value_repr=_toml_list(values))
+
+
+def append_toml_table(
+    config_path: Path,
+    *,
+    table: str,
+    values: dict[str, object],
+) -> None:
+    config_path = config_path.expanduser()
+    raw = config_path.read_text(encoding="utf-8")
+    lines = raw.splitlines()
+    if lines and lines[-1].strip() != "":
+        lines.append("")
+    lines.append(f"[[{table}]]")
+    for key, value in values.items():
+        if isinstance(value, bool):
+            value_repr = _toml_bool(value)
+        elif isinstance(value, int):
+            value_repr = _toml_int(value)
+        else:
+            value_repr = _toml_str(str(value))
+        lines.append(f"{key} = {value_repr}")
+    lines.append("")
+    config_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
