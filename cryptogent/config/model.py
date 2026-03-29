@@ -15,6 +15,21 @@ class TwitterAccountConfig:
 
 
 @dataclass(frozen=True)
+class LlmModelConfig:
+    name: str
+    provider: str | None
+    model: str | None
+    api_key: str | None
+    base_url: str | None
+    api_version: str | None
+    temperature: float | None
+    top_p: float | None
+    max_tokens: int | None
+    max_context_tokens: int | None
+    timeout_s: float | None
+
+
+@dataclass(frozen=True)
 class AppConfig:
     db_path: Path
     binance_api_key: str | None
@@ -74,3 +89,21 @@ class AppConfig:
 
     twscrape_db_path: Path | None
     twscrape_accounts_json: Path | None
+
+    llm_active_name: str | None
+    llm_models: tuple[LlmModelConfig, ...]
+    llm_provider: str | None
+    llm_model: str | None
+    llm_api_key: str | None
+    llm_base_url: str | None
+    llm_api_version: str | None
+    llm_temperature: float | None
+    llm_top_p: float | None
+    llm_max_tokens: int | None
+    llm_max_context_tokens: int | None
+    llm_timeout_s: float | None
+    llm_token_enforce_task: str | None
+    llm_token_enforce_provider: str | None
+
+    llm_memory_backend: str | None
+    llm_memory_path: Path | None

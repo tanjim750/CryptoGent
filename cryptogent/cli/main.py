@@ -21,10 +21,12 @@ from cryptogent.config.edit import (
     append_toml_table,
     toml_bool,
     toml_int,
+    toml_float,
     toml_str,
     update_binance_config,
     update_config_list,
     update_config_value,
+    update_llm_model,
 )
 from cryptogent.db.migrate import ensure_db_initialized
 from cryptogent.db.connection import connect
@@ -58,9 +60,26 @@ from cryptogent.validation.trade_request import ValidationError, validate_trade_
 from cryptogent.validation.binance_rules import parse_symbol_rules, precheck_market_buy, quantize_down, RuleError
 from cryptogent.planning.feasibility import FeasibilityError, evaluate_feasibility, freshness_and_consistency_checks
 from cryptogent.util.time import ms_to_utc_iso, utcnow_iso
+from cryptogent.llm.contracts import (
+    LLMContextBundle,
+    LLMTaskName,
+    MemoryBundle,
+    ProviderRequest,
+    TaskConstraints,
+    TaskOptions,
+)
+from cryptogent.llm.memory import MemoryManager, build_default_memory_manager
+from cryptogent.llm.memory.policies import MemoryPolicy
+from cryptogent.llm.providers.gemini_provider import GeminiProvider
+from cryptogent.llm.providers.ollama_provider import OllamaProvider
+from cryptogent.llm.providers.openai_provider import OpenAIProvider
+from cryptogent.llm.token_policy.policies import get_policy
+from cryptogent.llm.token_policy.token_estimator import estimate_tokens
 from decimal import Decimal, InvalidOperation
 import secrets
 import json as _json
+import urllib.request as _urlreq
+import urllib.error as _urlerr
 
 
 def _safe_json(value: Any) -> str | None:
@@ -155,6 +174,24 @@ def cmd_config_show(args: argparse.Namespace) -> int:
     print(f"- binance_api_secret_set: {bool(cfg.binance_api_secret)}")
     print(f"- binance_spot_bnb_burn: {cfg.binance_spot_bnb_burn}")
     print(f"- trading_monitoring_interval_seconds: {cfg.trading_monitoring_interval_seconds}")
+    print(f"- llm_active: {cfg.llm_active_name}")
+    if cfg.llm_models:
+        names = ", ".join(m.name for m in cfg.llm_models)
+        print(f"- llm_models: {names}")
+    else:
+        print(f"- llm_models: (none)")
+    print(f"- llm_provider: {cfg.llm_provider}")
+    print(f"- llm_model: {cfg.llm_model}")
+    print(f"- llm_api_key_set: {bool(cfg.llm_api_key)}")
+    print(f"- llm_base_url: {cfg.llm_base_url}")
+    print(f"- llm_api_version: {cfg.llm_api_version}")
+    print(f"- llm_temperature: {cfg.llm_temperature}")
+    print(f"- llm_top_p: {cfg.llm_top_p}")
+    print(f"- llm_max_tokens: {cfg.llm_max_tokens}")
+    print(f"- llm_max_context_tokens: {cfg.llm_max_context_tokens}")
+    print(f"- llm_timeout_s: {cfg.llm_timeout_s}")
+    print(f"- llm_token_enforce_task: {cfg.llm_token_enforce_task}")
+    print(f"- llm_token_enforce_provider: {cfg.llm_token_enforce_provider}")
     return 0
 
 
@@ -272,6 +309,87 @@ def cmd_config_set_twitter(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_config_set_llm(args: argparse.Namespace) -> int:
+    paths = ConfigPaths.from_cli(config_path=args.config, db_path=args.db)
+    config_path = ensure_default_config(paths.config_path)
+    cfg = load_config(config_path)
+
+    provider = str(args.provider or "").strip().lower()
+    if not provider:
+        print("Missing --provider (required).")
+        return 2
+
+    existing_max_context = None
+    for item in cfg.llm_models:
+        if item.name == provider:
+            existing_max_context = item.max_context_tokens
+            break
+
+    default_max_context_by_model = {
+        "gpt-4o-mini": 128_000,
+        "gemini-1.5-pro": 2_097_152,
+        "gemini-2.5-flash": 1_048_576,
+    }
+
+    updated = False
+    model_updates: dict[str, str] = {}
+    if args.provider is not None:
+        model_updates["provider"] = toml_str(args.provider)
+        updated = True
+    if args.model is not None:
+        model_updates["model"] = toml_str(args.model)
+        updated = True
+    if args.api_key is not None:
+        model_updates["api_key"] = toml_str(args.api_key)
+        updated = True
+    if args.base_url is not None:
+        model_updates["base_url"] = toml_str(args.base_url)
+        updated = True
+    if args.api_version is not None:
+        model_updates["api_version"] = toml_str(args.api_version)
+        updated = True
+    if args.temperature is not None:
+        model_updates["temperature"] = toml_float(args.temperature)
+        updated = True
+    if args.top_p is not None:
+        model_updates["top_p"] = toml_float(args.top_p)
+        updated = True
+    if args.max_tokens is not None:
+        model_updates["max_tokens"] = toml_int(args.max_tokens)
+        updated = True
+    if args.max_context_tokens is not None:
+        model_updates["max_context_tokens"] = toml_int(args.max_context_tokens)
+        updated = True
+    else:
+        model_name = (args.model or "").strip()
+        if model_name:
+            default_ctx = default_max_context_by_model.get(model_name)
+            if default_ctx is not None and existing_max_context is None:
+                model_updates["max_context_tokens"] = toml_int(default_ctx)
+                updated = True
+    if args.timeout_s is not None:
+        model_updates["timeout_s"] = toml_float(args.timeout_s)
+        updated = True
+
+    if provider == "ollama" and args.max_context_tokens is None and existing_max_context is None:
+        print("Missing --max-context-tokens for ollama (required).")
+        return 2
+
+    if model_updates:
+        update_llm_model(config_path, name=provider, values=model_updates)
+
+    if args.active:
+        update_config_value(config_path, section="llm", key="active", value_repr=toml_str(provider))
+        updated = True
+
+    if not updated:
+        print("Nothing to update.")
+        return 2
+
+    print(f"Updated: {config_path}")
+    return 0
+
+
 def cmd_config_add_twitter_account(args: argparse.Namespace) -> int:
     paths = ConfigPaths.from_cli(config_path=args.config, db_path=args.db)
     config_path = ensure_default_config(paths.config_path)
@@ -288,6 +406,378 @@ def cmd_config_add_twitter_account(args: argparse.Namespace) -> int:
     append_toml_table(config_path, table="twitter.accounts", values=values)
     print(f"Updated: {config_path} (added twitter account)")
     return 0
+
+
+def _ollama_client(*, base_url: str, timeout_s: float | None = None):
+    base = base_url.rstrip("/")
+
+    def _call(payload: dict) -> dict:
+        url = base + "/api/generate"
+        body = _json.dumps({**payload, "stream": False}).encode("utf-8")
+        req = _urlreq.Request(url, data=body, headers={"Content-Type": "application/json"})
+        with _urlreq.urlopen(req, timeout=timeout_s or 30) as resp:
+            raw = resp.read().decode("utf-8")
+            return _json.loads(raw)
+
+    return _call
+
+
+def _openai_client(*, base_url: str, api_key: str, timeout_s: float | None = None):
+    base = base_url.rstrip("/")
+
+    def _call(payload: dict) -> dict:
+        url = base + "/v1/chat/completions"
+        body = _json.dumps(payload).encode("utf-8")
+        req = _urlreq.Request(
+            url,
+            data=body,
+            headers={
+                "Content-Type": "application/json",
+                "Authorization": f"Bearer {api_key}",
+            },
+        )
+        with _urlreq.urlopen(req, timeout=timeout_s or 30) as resp:
+            raw = resp.read().decode("utf-8")
+            return _json.loads(raw)
+
+    return _call
+
+
+def _gemini_client(*, base_url: str, api_key: str, timeout_s: float | None = None):
+    base = base_url.rstrip("/")
+
+    def _call(payload: dict) -> dict:
+        model = payload.get("model")
+        if not model:
+            raise ValueError("Missing model for Gemini request")
+        url = f"{base}/v1beta/models/{model}:generateContent?key={api_key}"
+        body = _json.dumps(payload).encode("utf-8")
+        req = _urlreq.Request(url, data=body, headers={"Content-Type": "application/json"})
+        with _urlreq.urlopen(req, timeout=timeout_s or 30) as resp:
+            raw = resp.read().decode("utf-8")
+            return _json.loads(raw)
+
+    return _call
+
+
+def _build_llm_provider(
+    *,
+    provider: str,
+    model: str,
+    base_url: str | None,
+    api_key: str | None,
+    timeout_s: float,
+    verbose: bool,
+    max_context_tokens: int | None,
+    enforce_task_budget: str | None,
+    enforce_provider_cap: str | None,
+) -> object:
+    if provider == "ollama":
+        if not base_url:
+            base_url = "http://localhost:11434"
+        client = _ollama_client(base_url=base_url, timeout_s=timeout_s)
+        return OllamaProvider(
+            model=model,
+            client=client,
+            json_mode=True,
+            verbose=verbose,
+            max_context_tokens=max_context_tokens,
+            enforce_task_budget=enforce_task_budget,
+            enforce_provider_cap=enforce_provider_cap,
+        )
+    if provider == "openai":
+        if not base_url:
+            base_url = "https://api.openai.com"
+        if not api_key:
+            raise ValueError("Missing llm.api_key in config for OpenAI.")
+        client = _openai_client(base_url=base_url, api_key=api_key, timeout_s=timeout_s)
+        return OpenAIProvider(
+            model=model,
+            client=client,
+            json_mode=True,
+            verbose=verbose,
+            max_context_tokens=max_context_tokens,
+            enforce_task_budget=enforce_task_budget,
+            enforce_provider_cap=enforce_provider_cap,
+        )
+    if provider == "gemini":
+        if not base_url:
+            base_url = "https://generativelanguage.googleapis.com"
+        if not api_key:
+            raise ValueError("Missing llm.api_key in config for Gemini.")
+        client = _gemini_client(base_url=base_url, api_key=api_key, timeout_s=timeout_s)
+        return GeminiProvider(
+            model=model,
+            client=client,
+            json_mode=True,
+            verbose=verbose,
+            max_context_tokens=max_context_tokens,
+            enforce_task_budget=enforce_task_budget,
+            enforce_provider_cap=enforce_provider_cap,
+        )
+    raise ValueError("Unsupported provider. Use --provider ollama|openai|gemini.")
+
+
+def cmd_llm_test(args: argparse.Namespace) -> int:
+    paths = ConfigPaths.from_cli(config_path=args.config, db_path=args.db)
+    config_path = ensure_default_config(paths.config_path)
+    cfg = load_config(config_path)
+
+    provider = (args.provider or cfg.llm_provider or "").strip().lower()
+    model = (args.model or cfg.llm_model or "").strip()
+    prompt = args.prompt or "hi hello"
+    timeout_s = float(args.timeout_s) if args.timeout_s is not None else (cfg.llm_timeout_s or 30.0)
+
+    if provider not in ("ollama", "openai", "gemini"):
+        print("Unsupported provider. Use --provider ollama|openai|gemini.")
+        return 2
+    if not model:
+        print("Missing --model (e.g. llama3.1)")
+        return 2
+
+    base_url = str(args.base_url or cfg.llm_base_url or "").strip()
+    api_key = (cfg.llm_api_key or "").strip()
+    print(f"Active LLM: provider={provider} model={model}")
+
+    try:
+        provider_client = _build_llm_provider(
+            provider=provider,
+            model=model,
+            base_url=base_url,
+            api_key=api_key,
+            timeout_s=timeout_s,
+            verbose=bool(args.verbose),
+            max_context_tokens=cfg.llm_max_context_tokens,
+            enforce_task_budget=cfg.llm_token_enforce_task,
+            enforce_provider_cap=cfg.llm_token_enforce_provider,
+        )
+    except Exception as e:
+        print(f"ERROR: {e}")
+        return 2
+    ctx = LLMContextBundle(
+        task_name=LLMTaskName.INTENT_CLASSIFICATION,
+        inputs={"prompt": prompt},
+        constraints=TaskConstraints(),
+        options=TaskOptions(),
+        memory=None,
+        metadata=None,
+    )
+    req = ProviderRequest(
+        task_name=LLMTaskName.INTENT_CLASSIFICATION,
+        prompt=prompt,
+        context=ctx,
+        constraints=TaskConstraints(),
+        options=TaskOptions(timeout_s=timeout_s),
+        system_message="You are a helpful assistant.",
+        user_message=prompt,
+        response_format="text",
+    )
+    if args.verbose:
+        system_tokens = estimate_tokens(req.system_message or "")
+        user_tokens = estimate_tokens(req.user_message or "")
+        total_tokens = system_tokens + user_tokens
+        policy = get_policy(LLMTaskName.INTENT_CLASSIFICATION)
+        provider_cap = cfg.llm_max_context_tokens
+        print(
+            f"[TokenEstimate] system={system_tokens} user={user_tokens} total={total_tokens} "
+            f"policy_max={policy.max_tokens} provider_cap={provider_cap}"
+        )
+        if user_tokens > policy.max_tokens:
+            print(
+                "[TokenWarning] Estimated user tokens exceed task policy budget "
+                f"({user_tokens} > {policy.max_tokens})."
+            )
+        if provider_cap is not None and total_tokens > provider_cap:
+            print(
+                "[TokenWarning] Estimated tokens exceed provider context cap "
+                f"({total_tokens} > {provider_cap})."
+            )
+    if cfg.llm_token_enforce_task == "block":
+        user_tokens = estimate_tokens(req.user_message or "")
+        policy = get_policy(LLMTaskName.INTENT_CLASSIFICATION)
+        if user_tokens > policy.max_tokens:
+            print(
+                "[TokenBlock] User tokens exceed task policy budget "
+                f"({user_tokens} > {policy.max_tokens})."
+            )
+            return 2
+    if cfg.llm_token_enforce_provider == "block":
+        system_tokens = estimate_tokens(req.system_message or "")
+        user_tokens = estimate_tokens(req.user_message or "")
+        total_tokens = system_tokens + user_tokens
+        provider_cap = cfg.llm_max_context_tokens
+        if provider_cap is not None and total_tokens > provider_cap:
+            print(
+                "[TokenBlock] Total tokens exceed provider context cap "
+                f"({total_tokens} > {provider_cap})."
+            )
+            return 2
+    try:
+        resp = provider_client.generate(req)
+    except _urlerr.HTTPError as e:
+        body = e.read().decode("utf-8", errors="ignore")
+        print(f"ERROR: HTTP {e.code}: {body}")
+        return 2
+    except _urlerr.URLError as e:
+        print(f"ERROR: {e}")
+        return 2
+
+    print(resp.content)
+    return 0
+
+
+def cmd_llm_chat(args: argparse.Namespace) -> int:
+    paths = ConfigPaths.from_cli(config_path=args.config, db_path=args.db)
+    config_path = ensure_default_config(paths.config_path)
+    cfg = load_config(config_path)
+
+    provider = (args.provider or cfg.llm_provider or "").strip().lower()
+    model = (args.model or cfg.llm_model or "").strip()
+    timeout_s = float(args.timeout_s) if args.timeout_s is not None else (cfg.llm_timeout_s or 30.0)
+    base_url = str(args.base_url or cfg.llm_base_url or "").strip()
+    api_key = (cfg.llm_api_key or "").strip()
+    memory_limit = int(args.memory_limit or 50)
+
+    if provider not in ("ollama", "openai", "gemini"):
+        print("Unsupported provider. Use --provider ollama|openai|gemini.")
+        return 2
+    if not model:
+        print("Missing --model (e.g. llama3.1)")
+        return 2
+
+    print(f"Active LLM: provider={provider} model={model}")
+    try:
+        provider_client = _build_llm_provider(
+            provider=provider,
+            model=model,
+            base_url=base_url,
+            api_key=api_key,
+            timeout_s=timeout_s,
+            verbose=bool(args.verbose),
+            max_context_tokens=cfg.llm_max_context_tokens,
+            enforce_task_budget=cfg.llm_token_enforce_task,
+            enforce_provider_cap=cfg.llm_token_enforce_provider,
+        )
+    except Exception as e:
+        print(f"ERROR: {e}")
+        return 2
+
+    memory_key = "cli_chat"
+    memory_manager = build_default_memory_manager(config_path=paths.config_path)
+    print("Enter messages (Ctrl+C to exit).")
+    try:
+        while True:
+            user_text = input("> ").strip()
+            if not user_text:
+                continue
+            ts_user = datetime.now(UTC).isoformat()
+
+            memory_manager.append(
+                memory_key=memory_key,
+                task_name=LLMTaskName.INTENT_CLASSIFICATION,
+                role="user",
+                content=user_text,
+                timestamp_utc=ts_user,
+                source="cli_chat",
+            )
+            chat_policy = MemoryPolicy(enabled=True, max_items=5, recency_days=None, policy_name="chat")
+            memory_bundle = memory_manager.retrieve_memory(
+                task_name=LLMTaskName.INTENT_CLASSIFICATION,
+                memory_key=memory_key,
+                raw_inputs={},
+                conversation_state=None,
+                retrieval_limit=memory_limit,
+                policy=chat_policy,
+            )
+            memory_lines = []
+            for item in memory_bundle.items:
+                role = item.get("role")
+                content = item.get("content")
+                if role and content:
+                    memory_lines.append(f"{role}: {content}")
+            memory_block = "\n".join(memory_lines[-memory_limit:]) if memory_lines else ""
+            system_message = "You are a helpful assistant."
+            if memory_block:
+                system_message = system_message + "\nConversation so far:\n" + memory_block
+            user_message = user_text
+            ctx = LLMContextBundle(
+                task_name=LLMTaskName.INTENT_CLASSIFICATION,
+                inputs={"prompt": user_text},
+                constraints=TaskConstraints(),
+                options=TaskOptions(),
+                memory=memory_bundle,
+                metadata=None,
+            )
+            req = ProviderRequest(
+                task_name=LLMTaskName.INTENT_CLASSIFICATION,
+                prompt=user_text,
+                context=ctx,
+                constraints=TaskConstraints(),
+                options=TaskOptions(timeout_s=timeout_s),
+                system_message=system_message,
+                user_message=user_message,
+                response_format="text",
+            )
+            if args.verbose:
+                system_tokens = estimate_tokens(system_message)
+                user_tokens = estimate_tokens(user_message)
+                total_tokens = system_tokens + user_tokens
+                memory_count = len(memory_bundle.items) if memory_bundle else 0
+                policy = get_policy(LLMTaskName.INTENT_CLASSIFICATION)
+                provider_cap = cfg.llm_max_context_tokens
+                print(
+                    f"[TokenEstimate] system={system_tokens} user={user_tokens} total={total_tokens} "
+                    f"memory_items={memory_count} policy_max={policy.max_tokens} provider_cap={provider_cap}"
+                )
+                if user_tokens > policy.max_tokens:
+                    print(
+                        "[TokenWarning] Estimated user tokens exceed task policy budget "
+                        f"({user_tokens} > {policy.max_tokens})."
+                    )
+                if provider_cap is not None and total_tokens > provider_cap:
+                    print(
+                        "[TokenWarning] Estimated tokens exceed provider context cap "
+                        f"({total_tokens} > {provider_cap})."
+                    )
+            if cfg.llm_token_enforce_task == "block":
+                policy = get_policy(LLMTaskName.INTENT_CLASSIFICATION)
+                if user_tokens > policy.max_tokens:
+                    print(
+                        "[TokenBlock] User tokens exceed task policy budget "
+                        f"({user_tokens} > {policy.max_tokens})."
+                    )
+                    continue
+            if cfg.llm_token_enforce_provider == "block":
+                provider_cap = cfg.llm_max_context_tokens
+                if provider_cap is not None and total_tokens > provider_cap:
+                    print(
+                        "[TokenBlock] Total tokens exceed provider context cap "
+                        f"({total_tokens} > {provider_cap})."
+                    )
+                    continue
+            try:
+                resp = provider_client.generate(req)
+            except _urlerr.HTTPError as e:
+                body = e.read().decode("utf-8", errors="ignore")
+                print(f"ERROR: HTTP {e.code}: {body}")
+                continue
+            except _urlerr.URLError as e:
+                print(f"ERROR: {e}")
+                continue
+
+            print(resp.content)
+            ts_assistant = datetime.now(UTC).isoformat()
+            memory_manager.append(
+                memory_key=memory_key,
+                task_name=LLMTaskName.INTENT_CLASSIFICATION,
+                role="assistant",
+                content=resp.content,
+                timestamp_utc=ts_assistant,
+                source="cli_chat",
+            )
+    except KeyboardInterrupt:
+        print("\nExiting chat.")
+        return 0
 
 
 def cmd_status(args: argparse.Namespace) -> int:
@@ -494,6 +984,66 @@ def cmd_exchange_balances(args: argparse.Namespace) -> int:
         shown += 1
     if shown == 0:
         print("(no balances to show)")
+    return 0
+
+
+def _extract_trading_assets(info: dict) -> tuple[set[str], list[dict]]:
+    symbols = info.get("symbols")
+    if not isinstance(symbols, list):
+        return set(), []
+    trading = [s for s in symbols if isinstance(s, dict) and s.get("status") == "TRADING"]
+    assets: set[str] = set()
+    for s in trading:
+        base = s.get("baseAsset")
+        quote = s.get("quoteAsset")
+        if isinstance(base, str):
+            assets.add(base.upper())
+        if isinstance(quote, str):
+            assets.add(quote.upper())
+    return assets, trading
+
+
+def cmd_exchange_assets(args: argparse.Namespace) -> int:
+    client = _client_from_args(args)
+    try:
+        info = client.get_exchange_info()
+    except BinanceAPIError as e:
+        print(str(e))
+        return 2
+    assets, _ = _extract_trading_assets(info)
+    assets_list = sorted(assets)
+    limit = int(getattr(args, "limit", 0) or 0)
+    if limit > 0:
+        assets_list = assets_list[:limit]
+    print(f"assets={len(assets_list)}")
+    if assets_list:
+        print(" ".join(assets_list))
+    return 0
+
+
+def cmd_exchange_asset_check(args: argparse.Namespace) -> int:
+    client = _client_from_args(args)
+    asset = str(getattr(args, "asset", "") or "").strip().upper()
+    if not asset:
+        print("Missing asset symbol (e.g. SOL)")
+        return 2
+    try:
+        info = client.get_exchange_info()
+    except BinanceAPIError as e:
+        print(str(e))
+        return 2
+    _, symbols = _extract_trading_assets(info)
+    matches = [
+        s for s in symbols
+        if str(s.get("baseAsset") or "").upper() == asset
+        or str(s.get("quoteAsset") or "").upper() == asset
+    ]
+    available = bool(matches)
+    print(f"asset={asset} available={str(available)} pairs={len(matches)}")
+    if matches:
+        sample = [str(m.get("symbol")) for m in matches if m.get("symbol")]
+        limit = int(getattr(args, "limit", 10) or 10)
+        print("sample=" + ",".join(sample[:limit]))
     return 0
 
 
@@ -9144,6 +9694,26 @@ def build_parser() -> argparse.ArgumentParser:
     p_cfg_set_gnews.add_argument("--cache-ttl", type=int, default=None, help="Cache TTL seconds.")
     p_cfg_set_gnews.set_defaults(fn=cmd_config_set_gnews)
 
+    p_cfg_set_llm = cfg_sub.add_parser("set-llm", help="Update LLM provider config in cryptogent.toml.")
+    _add_common_paths(p_cfg_set_llm)
+    p_cfg_set_llm.add_argument(
+        "--provider",
+        type=str,
+        required=True,
+        help="LLM provider (openai|gemini|ollama|custom).",
+    )
+    p_cfg_set_llm.add_argument("--model", type=str, default=None, help="Model name or id.")
+    p_cfg_set_llm.add_argument("--api-key", type=str, default=None, help="Provider API key (plaintext).")
+    p_cfg_set_llm.add_argument("--base-url", type=str, default=None, help="Base URL override (e.g. http://localhost:11434).")
+    p_cfg_set_llm.add_argument("--api-version", type=str, default=None, help="Provider API version (optional).")
+    p_cfg_set_llm.add_argument("--temperature", type=float, default=None, help="Sampling temperature.")
+    p_cfg_set_llm.add_argument("--top-p", type=float, default=None, help="Top-p nucleus sampling.")
+    p_cfg_set_llm.add_argument("--max-tokens", type=int, default=None, help="Max output tokens.")
+    p_cfg_set_llm.add_argument("--max-context-tokens", type=int, default=None, help="Max context window tokens.")
+    p_cfg_set_llm.add_argument("--timeout-s", type=float, default=None, help="Request timeout seconds.")
+    p_cfg_set_llm.add_argument("--active", action="store_true", help="Set this LLM config as active.")
+    p_cfg_set_llm.set_defaults(fn=cmd_config_set_llm)
+
     p_cfg_set_twitter = cfg_sub.add_parser("set-twitter", help="Update Twitter/TwScrape config in cryptogent.toml.")
     _add_common_paths(p_cfg_set_twitter)
     p_cfg_set_twitter.add_argument("--user-agent", type=str, default=None, help="Twitter user agent.")
@@ -9163,6 +9733,29 @@ def build_parser() -> argparse.ArgumentParser:
     p_status = sub.add_parser("status", help="Show local setup status.")
     _add_common_paths(p_status)
     p_status.set_defaults(fn=cmd_status)
+
+    p_llm = sub.add_parser("llm", help="LLM utilities.")
+    _add_common_paths(p_llm)
+    llm_sub = p_llm.add_subparsers(dest="llm_cmd", required=True)
+    p_llm_test = llm_sub.add_parser("test", help="Send a simple test prompt to an LLM provider.")
+    _add_common_paths(p_llm_test)
+    p_llm_test.add_argument("--provider", type=str, default=None, help="Provider to use (default from config).")
+    p_llm_test.add_argument("--model", type=str, default=None, help="Model name (default from config).")
+    p_llm_test.add_argument("--prompt", type=str, default="hi hello", help="Prompt text.")
+    p_llm_test.add_argument("--base-url", type=str, default=None, help="Provider base URL (default from config).")
+    p_llm_test.add_argument("--timeout-s", type=float, default=None, help="Request timeout seconds.")
+    p_llm_test.add_argument("--verbose", action="store_true", help="Print provider request/response.")
+    p_llm_test.set_defaults(fn=cmd_llm_test)
+
+    p_llm_chat = llm_sub.add_parser("chat", help="Continuous chat with the active LLM.")
+    _add_common_paths(p_llm_chat)
+    p_llm_chat.add_argument("--provider", type=str, default=None, help="Provider to use (default from config).")
+    p_llm_chat.add_argument("--model", type=str, default=None, help="Model name (default from config).")
+    p_llm_chat.add_argument("--base-url", type=str, default=None, help="Provider base URL (default from config).")
+    p_llm_chat.add_argument("--timeout-s", type=float, default=None, help="Request timeout seconds.")
+    p_llm_chat.add_argument("--memory-limit", type=int, default=50, help="Max chat turns to keep in memory.")
+    p_llm_chat.add_argument("--verbose", action="store_true", help="Print provider request/response.")
+    p_llm_chat.set_defaults(fn=cmd_llm_chat)
 
     p_pos = sub.add_parser("position", help="Inspect stored positions (Phase 8; no execution).")
     _add_common_paths(p_pos)
@@ -9283,6 +9876,19 @@ def build_parser() -> argparse.ArgumentParser:
     _add_exchange_tls_args(p_ex_bal)
     p_ex_bal.add_argument("--all", action="store_true", help="Show zero balances too.")
     p_ex_bal.set_defaults(fn=cmd_exchange_balances)
+
+    p_ex_assets = ex_sub.add_parser("assets", help="List available assets from /api/v3/exchangeInfo.")
+    _add_common_paths(p_ex_assets)
+    _add_exchange_tls_args(p_ex_assets)
+    p_ex_assets.add_argument("--limit", type=int, default=0, help="Limit assets shown (default: 0=all).")
+    p_ex_assets.set_defaults(fn=cmd_exchange_assets)
+
+    p_ex_asset_check = ex_sub.add_parser("asset-check", help="Check if an asset is available on the exchange.")
+    _add_common_paths(p_ex_asset_check)
+    _add_exchange_tls_args(p_ex_asset_check)
+    p_ex_asset_check.add_argument("asset", type=str, help="Asset symbol (e.g. SOL).")
+    p_ex_asset_check.add_argument("--limit", type=int, default=10, help="Limit sample pairs shown (default: 10).")
+    p_ex_asset_check.set_defaults(fn=cmd_exchange_asset_check)
 
     p_sync = sub.add_parser("sync", help="Sync exchange state into the local SQLite cache (no trading).")
     _add_common_paths(p_sync)

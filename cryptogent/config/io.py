@@ -5,7 +5,7 @@ import tomllib
 from dataclasses import dataclass
 from pathlib import Path
 
-from cryptogent.config.model import AppConfig, TwitterAccountConfig
+from cryptogent.config.model import AppConfig, LlmModelConfig, TwitterAccountConfig
 
 
 DEFAULT_CONFIG_PATH = Path("cryptogent.toml")
@@ -173,6 +173,30 @@ def ensure_default_config(config_path: Path) -> Path:
                 'email_password = ""',
                 'phone = ""',
                 "",
+                "[llm]",
+                'active = "openai"',
+                "",
+                "[[llm.models]]",
+                'name = "openai"',
+                'provider = "openai"  # openai|gemini|ollama|custom',
+                'model = ""',
+                'api_key = ""',
+                'base_url = ""  # optional override (e.g. http://localhost:11434 for ollama)',
+                'api_version = ""  # optional (some providers need this)',
+                "temperature = 0.2",
+                "top_p = 1.0",
+                "max_tokens = 1024",
+                "max_context_tokens = 8192",
+                "timeout_s = 60",
+                "",
+                "[llm.token_policy]",
+                'enforce_task_budget = "warn"  # warn|block|off',
+                'enforce_provider_cap = "warn"  # warn|block|off',
+                "",
+                "[llm_memory]",
+                'backend = "sqlite"  # sqlite|jsonl|memory|txt',
+                'path = "llm_memory.sqlite3"',
+                "",
             ]
         ),
         encoding="utf-8",
@@ -196,6 +220,9 @@ def load_config(config_path: Path) -> AppConfig:
     telegram = data.get("telegram", {})
     youtube = data.get("youtube", {})
     twscrape = data.get("twscrape", {})
+    llm = data.get("llm", {})
+    llm_memory = data.get("llm_memory", {})
+    llm_token_policy = llm.get("token_policy", {}) if isinstance(llm.get("token_policy"), dict) else {}
 
     db_path = Path(app.get("db_path") or DEFAULT_DB_PATH).expanduser()
 
@@ -239,6 +266,19 @@ def load_config(config_path: Path) -> AppConfig:
 
     bnb_burn_value = (binance_testnet.get("spot_bnb_burn") if testnet_enabled else binance.get("spot_bnb_burn"))
     spot_bnb_burn = _as_optional_bool(os.environ.get("CRYPTOGENT_SPOT_BNB_BURN") or bnb_burn_value)
+
+    llm_models = _parse_llm_models(llm)
+    llm_active_name = _as_optional_str(llm.get("active"))
+    if not llm_active_name and llm_models:
+        llm_active_name = llm_models[0].name
+    llm_active = None
+    if llm_models:
+        for m in llm_models:
+            if llm_active_name and m.name == llm_active_name:
+                llm_active = m
+                break
+        if llm_active is None:
+            llm_active = llm_models[0]
 
     return AppConfig(
         db_path=db_path,
@@ -311,6 +351,24 @@ def load_config(config_path: Path) -> AppConfig:
             if twscrape.get("accounts_json") not in (None, "")
             else None
         ),
+        llm_active_name=llm_active_name,
+        llm_models=llm_models,
+        llm_provider=(llm_active.provider if llm_active else None),
+        llm_model=(llm_active.model if llm_active else None),
+        llm_api_key=(llm_active.api_key if llm_active else None),
+        llm_base_url=(llm_active.base_url if llm_active else None),
+        llm_api_version=(llm_active.api_version if llm_active else None),
+        llm_temperature=(llm_active.temperature if llm_active else None),
+        llm_top_p=(llm_active.top_p if llm_active else None),
+        llm_max_tokens=(llm_active.max_tokens if llm_active else None),
+        llm_max_context_tokens=(llm_active.max_context_tokens if llm_active else None),
+        llm_timeout_s=(llm_active.timeout_s if llm_active else None),
+        llm_token_enforce_task=_as_optional_str(llm_token_policy.get("enforce_task_budget")),
+        llm_token_enforce_provider=_as_optional_str(llm_token_policy.get("enforce_provider_cap")),
+        llm_memory_backend=(str(llm_memory.get("backend")).strip().lower() if llm_memory.get("backend") not in (None, "") else None),
+        llm_memory_path=(
+            Path(str(llm_memory.get("path"))).expanduser() if llm_memory.get("path") not in (None, "") else None
+        ),
     )
 
 
@@ -322,6 +380,26 @@ def _as_optional_int(value: object) -> int | None:
     if isinstance(value, str) and value.strip():
         try:
             return int(value.strip())
+        except Exception:
+            return None
+    return None
+
+
+def _as_optional_str(value: object) -> str | None:
+    if value is None:
+        return None
+    s = str(value).strip()
+    return s if s else None
+
+
+def _as_optional_float(value: object) -> float | None:
+    if value is None:
+        return None
+    if isinstance(value, (int, float)):
+        return float(value)
+    if isinstance(value, str) and value.strip():
+        try:
+            return float(value.strip())
         except Exception:
             return None
     return None
@@ -376,3 +454,72 @@ def _parse_twitter_accounts(
             )
         )
     return tuple(accounts)
+
+
+def _parse_llm_models(llm: dict) -> tuple[LlmModelConfig, ...]:
+    models_raw = llm.get("models")
+    items: list[dict] = []
+    if isinstance(models_raw, list):
+        items = [m for m in models_raw if isinstance(m, dict)]
+
+    # Backward compatibility: support legacy [llm] keys.
+    legacy_keys = (
+        "provider",
+        "model",
+        "api_key",
+        "base_url",
+        "api_version",
+        "temperature",
+        "top_p",
+        "max_tokens",
+        "max_context_tokens",
+        "timeout_s",
+    )
+    if not items and any(k in llm for k in legacy_keys):
+        items = [
+            {
+                "name": "default",
+                "provider": llm.get("provider"),
+                "model": llm.get("model"),
+                "api_key": llm.get("api_key"),
+                "base_url": llm.get("base_url"),
+                "api_version": llm.get("api_version"),
+                "temperature": llm.get("temperature"),
+                "top_p": llm.get("top_p"),
+                "max_tokens": llm.get("max_tokens"),
+                "max_context_tokens": llm.get("max_context_tokens"),
+                "timeout_s": llm.get("timeout_s"),
+            }
+        ]
+
+    models: list[LlmModelConfig] = []
+    for item in items:
+        name = _as_optional_str(item.get("name")) or "default"
+        provider = _as_optional_str(item.get("provider"))
+        if provider:
+            provider = provider.lower()
+        model = _as_optional_str(item.get("model"))
+        api_key = _as_optional_str(item.get("api_key"))
+        base_url = _as_optional_str(item.get("base_url"))
+        api_version = _as_optional_str(item.get("api_version"))
+        temperature = _as_optional_float(item.get("temperature"))
+        top_p = _as_optional_float(item.get("top_p"))
+        max_tokens = _as_optional_int(item.get("max_tokens"))
+        max_context_tokens = _as_optional_int(item.get("max_context_tokens"))
+        timeout_s = _as_optional_float(item.get("timeout_s"))
+        models.append(
+            LlmModelConfig(
+                name=name,
+                provider=provider,
+                model=model,
+                api_key=api_key,
+                base_url=base_url,
+                api_version=api_version,
+                temperature=temperature,
+                top_p=top_p,
+                max_tokens=max_tokens,
+                max_context_tokens=max_context_tokens,
+                timeout_s=timeout_s,
+            )
+        )
+    return tuple(models)

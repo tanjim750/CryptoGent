@@ -42,6 +42,9 @@ Most commands accept:
 - `cryptogent config set-bnb-burn --disabled`  
   Disable paying Spot fees with BNB.
 
+- `cryptogent config set-llm --provider openai --model "gpt-4o-mini" --api-key "..." --active`  
+  Create/update an LLM config (supports `openai`, `gemini`, `ollama`, `custom`) and optionally set it active.
+
 Notes:
 
 - Recommended: use environment variables instead of storing secrets:
@@ -70,6 +73,17 @@ Commands:
 
 - `cryptogent exchange balances [--all]`  
   Calls `GET /api/v3/account` and prints balances (requires API key+secret).
+
+- `cryptogent exchange assets [--limit N]`  
+  Lists available assets from `GET /api/v3/exchangeInfo` (TRADING symbols only).
+
+- `cryptogent exchange asset-check <ASSET> [--limit N]`  
+  Checks if a specific asset is available and prints sample pairs.
+
+## LLM
+
+- `cryptogent llm test --provider ollama --model "llama3.1" --prompt "hi hello"`  
+  Send a simple test prompt to an LLM provider (currently supports `ollama`).
 
 ## Sync (writes to SQLite; no trading)
 

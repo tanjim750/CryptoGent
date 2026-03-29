@@ -76,6 +76,33 @@ def _set_kv_in_section(lines: list[str], *, section: str, key: str, value_repr: 
     return out
 
 
+def _set_kv_in_block(
+    lines: list[str], *, block_start: int, block_end: int, key: str, value_repr: str, insert_after: int | None = None
+) -> list[str]:
+    out = lines[:]
+    if block_end > len(out):
+        block_end = len(out)
+    if block_end < block_start + 1:
+        block_end = block_start + 1
+    needle = key.strip()
+    for k in range(block_start + 1, block_end):
+        raw = out[k]
+        stripped = raw.lstrip()
+        if stripped.startswith("#") or "=" not in stripped:
+            continue
+        left, _right = stripped.split("=", 1)
+        if left.strip() == needle:
+            indent = raw[: len(raw) - len(stripped)]
+            out[k] = f"{indent}{needle} = {value_repr}"
+            return out
+
+    insert_at = insert_after if insert_after is not None else block_start + 1
+    if insert_at < block_start + 1 or insert_at > block_end:
+        insert_at = block_start + 1
+    out.insert(insert_at, f"{needle} = {value_repr}")
+    return out
+
+
 def _toml_str(value: str) -> str:
     escaped = value.replace("\\", "\\\\").replace('"', '\\"')
     return f'"{escaped}"'
@@ -94,6 +121,10 @@ def _toml_int(value: int) -> str:
     return str(int(value))
 
 
+def _toml_float(value: float) -> str:
+    return str(float(value))
+
+
 def _toml_list(values: list[str]) -> str:
     return "[" + ", ".join(_toml_str(v) for v in values) + "]"
 
@@ -108,6 +139,10 @@ def toml_bool(value: bool) -> str:
 
 def toml_int(value: int) -> str:
     return _toml_int(value)
+
+
+def toml_float(value: float) -> str:
+    return _toml_float(value)
 
 
 def update_binance_config(config_path: Path, update: BinanceCredentialUpdate) -> None:
@@ -190,4 +225,92 @@ def append_toml_table(
             value_repr = _toml_str(str(value))
         lines.append(f"{key} = {value_repr}")
     lines.append("")
+    config_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+
+def update_llm_model(
+    config_path: Path,
+    *,
+    name: str,
+    values: dict[str, str],
+) -> None:
+    config_path = config_path.expanduser()
+    raw = config_path.read_text(encoding="utf-8")
+    lines = raw.splitlines()
+
+    def _is_table_header(line: str) -> bool:
+        s = line.strip()
+        return s.startswith("[") and s.endswith("]") and len(s) >= 3
+
+    def _parse_name(line: str) -> str | None:
+        stripped = line.strip()
+        if stripped.startswith("#") or "=" not in stripped:
+            return None
+        left, right = stripped.split("=", 1)
+        if left.strip() != "name":
+            return None
+        val = right.strip()
+        if val.startswith('"') and val.endswith('"') and len(val) >= 2:
+            return val[1:-1].replace('\\"', '"').replace("\\\\", "\\")
+        if val.startswith("'") and val.endswith("'") and len(val) >= 2:
+            return val[1:-1]
+        return val
+
+    target_start = None
+    target_end = None
+    name_line_idx = None
+    i = 0
+    while i < len(lines):
+        if lines[i].strip() == "[[llm.models]]":
+            block_start = i
+            block_end = len(lines)
+            for j in range(block_start + 1, len(lines)):
+                if _is_table_header(lines[j]):
+                    block_end = j
+                    break
+            for k in range(block_start + 1, block_end):
+                parsed = _parse_name(lines[k])
+                if parsed is not None:
+                    if parsed == name:
+                        target_start = block_start
+                        target_end = block_end
+                        name_line_idx = k
+                    break
+            if target_start is not None:
+                break
+            i = block_end
+            continue
+        i += 1
+
+    if target_start is None:
+        if lines and lines[-1].strip() != "":
+            lines.append("")
+        lines.append("[[llm.models]]")
+        lines.append(f'name = "{name}"')
+        for key, value_repr in values.items():
+            if key == "name":
+                continue
+            lines.append(f"{key} = {value_repr}")
+        lines.append("")
+        config_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+        return
+
+    block_start = target_start
+    block_end = target_end if target_end is not None else len(lines)
+    insert_after = name_line_idx if name_line_idx is not None else block_start
+    for key, value_repr in values.items():
+        if key == "name":
+            continue
+        lines = _set_kv_in_block(
+            lines,
+            block_start=block_start,
+            block_end=block_end,
+            key=key,
+            value_repr=value_repr,
+            insert_after=insert_after + 1 if insert_after is not None else None,
+        )
+        if name_line_idx is not None and insert_after is not None:
+            insert_after += 1
+            block_end += 1
+
     config_path.write_text("\n".join(lines) + "\n", encoding="utf-8")

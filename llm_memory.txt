@@ -1,0 +1,22 @@
+2026-03-29T07:13:34.223099+00:00 cli_chat_3 user: hi
+2026-03-29T07:13:35.637014+00:00 cli_chat_3 assistant: Hi there! How can I help you today?
+2026-03-29T07:14:07.784831+00:00 cli_chat_3 user: my name is Tanjim
+2026-03-29T07:14:09.531867+00:00 cli_chat_3 assistant: It's nice to meet you, Tanjim!
+2026-03-29T07:14:36.504032+00:00 cli_chat_3 user: can you recall my name?
+2026-03-29T07:14:38.792604+00:00 cli_chat_3 assistant: I'm sorry, I cannot recall your name. As an AI, I don't have memory of past conversations or personal information about users. Each interaction is new for me.
+2026-03-29T07:29:14.752408+00:00 cli_chat_3 user: hi
+2026-03-29T07:29:16.544223+00:00 cli_chat_3 assistant: Hi again! How can I help you today?
+2026-03-29T07:29:46.996945+00:00 cli_chat_3 user: can recall my name
+2026-03-29T07:29:48.415079+00:00 cli_chat_3 assistant: I'm sorry, I still can't recall your name. As an AI, I don't retain information from previous interactions.
+2026-03-29T07:31:16.833372+00:00 cli_chat_3 user: are you sure?
+2026-03-29T07:31:18.430934+00:00 cli_chat_3 assistant: Yes, I am sure. As a large language model, I don't have memory of past conversations or a personal identity. Each time you interact with me, it's a fresh start, and I don't retain any information from previous interactions.
+2026-03-29T07:31:40.929404+00:00 cli_chat_3 user: i am tanjim
+2026-03-29T07:31:42.791558+00:00 cli_chat_3 assistant: Thank you for letting me know, Tanjim. It's nice to "meet" you again, or rather, to have you identify yourself.
+2026-03-29T07:32:14.415637+00:00 cli_chat_3 user: can you recall anything?
+2026-03-29T07:32:16.827436+00:00 cli_chat_3 assistant: Yes, within *this current conversation*, I can recall information that has been shared.
+
+For example, you just told me your name is Tanjim, and I can recall that for the rest of our current chat.
+
+What I *cannot* do is recall anything from a previous conversation we might have had, or retain information about you for future interactions. Each time you start a new conversation with me, it's a clean slate.
+2026-03-29T07:32:53.306343+00:00 cli_chat_3 user: recall my name
+2026-03-29T07:32:54.591500+00:00 cli_chat_3 assistant: Your name is Tanjim.

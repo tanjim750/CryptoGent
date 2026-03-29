@@ -29,7 +29,8 @@ pyproject.toml
 ./cryptogent/execution/result_parser.py
 ./cryptogent/exit_control/__init__.py
 ./cryptogent/feasibility/__init__.py
-./cryptogent/llm_advisory/__init__.py
+./cryptogent/agent/__init__.py
+./cryptogent/llm/__init__.py
 ./cryptogent/market/__init__.py
 ./cryptogent/market/candles.py
 ./cryptogent/market/compute_engine.py
@@ -95,7 +96,8 @@ cryptogent/execution/executor.py
 cryptogent/execution/result_parser.py
 cryptogent/exit_control/__init__.py
 cryptogent/feasibility/__init__.py
-cryptogent/llm_advisory/__init__.py
+cryptogent/agent/__init__.py
+cryptogent/llm/__init__.py
 cryptogent/market/__init__.py
 cryptogent/market/candles.py
 cryptogent/market/compute_engine.py
